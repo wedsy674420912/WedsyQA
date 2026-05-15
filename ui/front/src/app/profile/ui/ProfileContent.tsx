@@ -1,0 +1,668 @@
+'use client'
+
+import { getUserUserId, ModelUserInfo, ModelUserRole, putUser } from '@/api'
+import { SvcUserStatisticsRes } from '@/api/types'
+import { Message, useGuestActivation } from '@/components'
+import { AuthContext } from '@/components/authProvider'
+import UserAvatar from '@/components/UserAvatar'
+import Alert from "@/components/alert";
+import { useRouterWithRouteName } from '@/hooks/useRouterWithForum'
+import PhotoCameraIcon from '@mui/icons-material/PhotoCamera'
+import { showCustomPointNotification } from '@/utils/pointNotification'
+import {
+  Box,
+  Button,
+  Card,
+  Divider,
+  IconButton,
+  Stack,
+  TextField,
+  Theme,
+  ToggleButton,
+  ToggleButtonGroup,
+  Typography,
+} from '@mui/material'
+import { usePathname, useSearchParams } from 'next/navigation'
+import { useCallback, useContext, useEffect, useMemo, useState } from 'react'
+import BindEmailModal from './BindEmailModal'
+import ChangePasswordModal from './ChangePasswordModal'
+import NotificationCenter from './NotificationCenter'
+import ProfileHeroCard from './ProfileHeroCard'
+import UserTrendList from './UserTrendList'
+import QuickReplyList from './QuickReplyList'
+import FollowingIssuesList from './FollowingIssuesList'
+import UserPointList from './UserPointList'
+import { roleConfig } from '@/constant'
+import { isAdminRole } from '@/lib/utils'
+import { Ellipsis } from '@ctzhian/ui'
+
+interface ProfileContentProps {
+  initialUser: ModelUserInfo
+}
+
+interface TabPanelProps {
+  children?: React.ReactNode
+  index: number
+  value: number
+}
+
+function TabPanel(props: TabPanelProps) {
+  const { children, value, index, ...other } = props
+
+  return (
+    <div
+      role='tabpanel'
+      hidden={value !== index}
+      id={`profile-tabpanel-${index}`}
+      aria-labelledby={`profile-tab-${index}`}
+      {...other}
+    >
+      {value === index && <Box sx={{ px: 3, pb: 0 }}>{children}</Box>}
+    </div>
+  )
+}
+
+export default function ProfileContent({ initialUser }: ProfileContentProps) {
+  const { user, setUser, fetchUser } = useContext(AuthContext)
+  const { openModal } = useGuestActivation()
+  const routerWithRouteName = useRouterWithRouteName()
+  const router = routerWithRouteName.router
+  const searchParams = useSearchParams()
+  const pathname = usePathname()
+
+  // 从 URL 参数读取 tab 值，默认为 0
+  const initialTabValue = searchParams?.get('tab') ? parseInt(searchParams.get('tab')!, 10) : 0
+  const [tabValue, setTabValue] = useState(initialTabValue)
+  const [isEditingName, setIsEditingName] = useState(false)
+  const [editName, setEditName] = useState(user?.username || '')
+  const [isEditingBio, setIsEditingBio] = useState(false)
+  const [editBio, setEditBio] = useState(user?.intro || initialUser?.intro || '暂无个人介绍')
+  const [isUploading, setIsUploading] = useState(false)
+  const [changePasswordModalOpen, setChangePasswordModalOpen] = useState(false)
+  const [bindEmailModalOpen, setBindEmailModalOpen] = useState(false)
+  const [statistics, setStatistics] = useState<SvcUserStatisticsRes | null>(null)
+  const isGuestUser = useMemo(
+    () => (user?.role ?? initialUser?.role) === ModelUserRole.UserRoleGuest,
+    [initialUser?.role, user?.role],
+  )
+  // 判断是否是当前用户（只能查看自己的积分明细）
+  const isCurrentUser = useMemo(() => user?.uid === initialUser?.uid, [user?.uid, initialUser?.uid])
+  const isAdmin = isAdminRole(user.role || ModelUserRole.UserRoleGuest)
+
+  // 更新查询参数并切换到动态标签页
+  const updateQueryParams = useCallback(
+    (discussionType: string, trendType: string) => {
+      const params = new URLSearchParams(searchParams?.toString() || '')
+      params.set('tab', '0') // 切换到动态标签页
+      params.set('discussion_type', discussionType)
+      params.set('trend_type', trendType)
+      const queryString = params.toString()
+      const newUrl = queryString ? `${pathname}?${queryString}` : pathname
+      router.replace(newUrl)
+    },
+    [router, pathname, searchParams],
+  )
+
+  // 计算积分明细 tab 的索引
+  const metrics = useMemo(
+    () => [
+      {
+        label: '问题',
+        value: statistics?.qa_count ?? 0,
+        onClick: () => updateQueryParams('qa', '1'),
+      },
+      {
+        label: '文章',
+        value: statistics?.blog_count ?? 0,
+        onClick: () => updateQueryParams('blog', '1'),
+      },
+      {
+        label: '回答',
+        value: statistics?.answer_count ?? 0,
+        onClick: () => updateQueryParams('qa', '3'),
+      },
+      {
+        label: '积分',
+        value: statistics?.point ?? 0,
+        onClick: isCurrentUser
+          ? () => {
+            const params = new URLSearchParams(searchParams?.toString() || '')
+            params.set('tab', '5')
+            const queryString = params.toString()
+            const newUrl = queryString ? `${pathname}?${queryString}` : pathname
+            router.replace(newUrl)
+          }
+          : undefined,
+      },
+    ],
+    [statistics, isCurrentUser, pathname, router, searchParams, updateQueryParams],
+  )
+
+  useEffect(() => {
+    if (initialUser) {
+      setUser(initialUser)
+      setEditName(initialUser.username || '')
+      setEditBio(initialUser.intro || '暂无个人介绍')
+    }
+  }, [initialUser, setUser])
+
+  useEffect(() => {
+    const userId = user?.uid || initialUser?.uid
+    if (!userId) return
+
+    let cancelled = false
+      ; (async () => {
+        try {
+          const response = await getUserUserId({ userId })
+          if (!cancelled) {
+            setStatistics(response)
+          }
+        } catch (error) {
+          console.error('获取用户统计信息失败', error)
+        }
+      })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [user?.uid, initialUser?.uid])
+
+  // 监听 URL 参数变化，同步 tab 值
+  useEffect(() => {
+    const tabFromUrl = searchParams?.get('tab') ? parseInt(searchParams.get('tab')!, 10) : 0
+    setTabValue(tabFromUrl)
+  }, [searchParams])
+
+  const handleTabChange = (_event: React.MouseEvent<HTMLElement>, newValue: string | null) => {
+    if (newValue === null) return
+    const tabIndex = parseInt(newValue, 10)
+    setTabValue(tabIndex)
+    // 更新 URL 参数
+    const params = new URLSearchParams(searchParams?.toString() || '')
+    // 切换 tab 时，清空 discussion_type 和 trend_type 参数
+    params.delete('discussion_type')
+    params.delete('trend_type')
+    if (tabIndex === 0) {
+      // 如果回到默认 tab，移除参数
+      params.delete('tab')
+    } else {
+      params.set('tab', tabIndex.toString())
+    }
+    const queryString = params.toString()
+    const newUrl = queryString ? `${pathname}?${queryString}` : pathname
+    router.replace(newUrl)
+  }
+
+  const toggleButtonSx = {
+    height: { xs: 28, sm: 30 },
+    fontWeight: 500,
+    fontSize: { xs: '13px', sm: '14px' },
+    color: '#21222D',
+    border: '1px solid transparent',
+    px: { xs: 1.25, sm: 2 },
+    py: { xs: 0.5, sm: 0.75 },
+    whiteSpace: 'nowrap',
+    flex: { xs: '0 1 auto', sm: 'none' },
+    '&.Mui-selected': {
+      bgcolor: (theme: Theme) => theme.palette.primaryAlpha?.[6],
+      border: (theme: Theme) => `1px solid ${theme.palette.primaryAlpha?.[10]}`,
+      color: 'primary.main',
+      '&.Mui-focusVisible': {
+        bgcolor: '#000000',
+        color: '#ffffff',
+        outline: '2px solid #000000',
+        outlineOffset: '2px',
+      },
+    },
+    '&:hover': { bgcolor: '#f3f4f6', color: '#000000' },
+  }
+
+  const handleSaveName = async () => {
+    if (!editName.trim()) return
+
+    try {
+      await putUser({ name: editName })
+      Alert.success('更新用户名成功')
+      setUser({ ...user, username: editName })
+      setIsEditingName(false)
+    } catch (error) {
+      console.error('更新用户名失败:', error)
+    }
+  }
+
+  const handleCancelEdit = () => {
+    setEditName(user?.username || '')
+    setIsEditingName(false)
+  }
+
+  const handleSaveBio = async () => {
+    try {
+      await putUser({ intro: editBio || '暂无个人介绍' })
+      Alert.success('更新个人介绍成功')
+      setUser({ ...user, intro: editBio || '暂无个人介绍' })
+      setIsEditingBio(false)
+
+      // 刷新统计信息以更新积分显示（如果后端给了完善个人介绍的积分奖励，会在这里显示）
+      const response = await getUserUserId({ userId: user?.uid || initialUser?.uid || 0 })
+      const oldPoint = statistics?.point || 0
+      const newPoint = response?.point || 0
+      if (newPoint > oldPoint) {
+        // 如果积分增加了，显示积分提示
+        showCustomPointNotification(newPoint - oldPoint)
+      }
+      setStatistics(response)
+    } catch (error) {
+      console.error('更新个人介绍失败:', error)
+    }
+  }
+
+  const handleCancelEditBio = () => {
+    setEditBio(user?.intro || initialUser?.intro || '暂无个人介绍')
+    setIsEditingBio(false)
+  }
+
+  const handleAvatarUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (!file) return
+
+    // 验证文件类型和大小
+    if (!file.type.startsWith('image/')) {
+      alert('请选择图片文件')
+      return
+    }
+
+    if (file.size > 5 * 1024 * 1024) {
+      alert('图片大小不能超过5MB')
+      return
+    }
+
+    setIsUploading(true)
+    try {
+      const oldPoint = statistics?.point || 0
+      await putUser({ avatar: file })
+
+      // 头像上传成功后，重新获取用户信息以获取最新的头像URL
+      await fetchUser()
+
+      // 刷新统计信息以更新积分显示（如果后端给了完善头像的积分奖励，会在这里显示）
+      const response = await getUserUserId({ userId: user?.uid || initialUser?.uid || 0 })
+      const newPoint = response?.point || 0
+      if (newPoint > oldPoint) {
+        // 如果积分增加了，显示积分提示
+        showCustomPointNotification(newPoint - oldPoint)
+      }
+      setStatistics(response)
+    } catch (error) {
+      console.error('头像上传失败:', error)
+    } finally {
+      setIsUploading(false)
+    }
+  }
+
+  const handleChangePasswordClick = () => {
+    // 如果用户没有绑定邮箱，提示先绑定邮箱
+    if (!user?.email) {
+      Message.warning('请先绑定邮箱后再修改密码')
+      setBindEmailModalOpen(true)
+      return
+    }
+    // 如果已绑定邮箱，打开修改密码模态框
+    setChangePasswordModalOpen(true)
+  }
+
+  return (
+    <Box
+      sx={{
+        maxWidth: 780,
+        mx: 'auto',
+        mt: 3,
+        bgcolor: 'background.paper',
+        borderRadius: 1,
+        border: (theme) => `1px solid ${theme.palette.mode === 'light' ? '#EAECF0' : '#393939'}`,
+      }}
+    >
+      {/* 头部背景区域 */}
+      <ProfileHeroCard
+        role={user.role || ModelUserRole.UserRoleGuest}
+        subtitle={user?.intro || initialUser?.intro || '暂无个人介绍'}
+        avatar={
+          <Box sx={{ position: 'relative' }}>
+            <Box
+              sx={{
+                borderRadius: '50%',
+                width: 88,
+                height: 88,
+                background: '#fff',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+            >
+              <UserAvatar
+                user={user}
+                sx={{
+                  width: '100%',
+                  height: '100%',
+                }}
+              />
+            </Box>
+            <IconButton
+              component='label'
+              sx={{
+                position: 'absolute',
+                bottom: 0,
+                right: 0,
+                backgroundColor: 'primary.main',
+                color: 'primary.contrastText',
+                width: 32,
+                height: 32,
+              }}
+              disabled={isUploading}
+            >
+              <PhotoCameraIcon fontSize='small' />
+              <input type='file' hidden accept='image/*' onChange={handleAvatarUpload} />
+            </IconButton>
+          </Box>
+        }
+        title={user?.username || initialUser?.username || '用户'}
+        metrics={metrics}
+      />
+
+      {/* 标签页 */}
+      <Box sx={{ px: { xs: 2, sm: 3 }, pb: { xs: 2, sm: 3 } }}>
+        <Divider sx={{ mb: 3 }} />
+        <ToggleButtonGroup
+          value={tabValue.toString()}
+          onChange={handleTabChange}
+          exclusive
+          aria-label='个人中心标签页'
+          sx={{
+            display: 'flex',
+            flexWrap: 'wrap',
+            gap: { xs: 0, sm: 1 },
+            '& .MuiToggleButtonGroup-grouped': {
+              borderRadius: '6px !important',
+              mr: 0,
+              whiteSpace: 'nowrap',
+              '&.Mui-selected': {
+                bgcolor: 'primary.main',
+                color: (theme) => theme.palette.primary.contrastText,
+                '&:hover': {
+                  bgcolor: 'primary.dark',
+                }
+              },
+            },
+          }}
+        >
+          <ToggleButton value='0' sx={toggleButtonSx}>
+            动态
+          </ToggleButton>
+          <ToggleButton value='1' sx={toggleButtonSx}>
+            基本信息
+          </ToggleButton>
+          {isAdminRole(user.role || ModelUserRole.UserRoleGuest) && (
+            <ToggleButton value='2' sx={toggleButtonSx}>
+              客服配置
+            </ToggleButton>
+          )}
+          <ToggleButton value={isAdminRole(user.role || ModelUserRole.UserRoleGuest) ? '3' : '2'} sx={toggleButtonSx}>
+            关注收藏
+          </ToggleButton>
+          <ToggleButton value={'4'} sx={toggleButtonSx}>
+            通知中心
+          </ToggleButton>
+        </ToggleButtonGroup>
+      </Box>
+      {/* 子元素 role=tabpanel 的加个 border */}
+      <Box
+        sx={{
+          px: 3,
+          '& > [role=tabpanel]': {
+            mb: 2,
+            mt: 0,
+            borderRadius: 1,
+            border: (theme) => `1px solid ${theme.palette.mode === 'light' ? '#EAECF0' : '#393939'}`,
+            p: 2,
+            pt: 0,
+            '& > div': {
+              p: 0,
+            },
+          },
+        }}
+      >
+        <TabPanel value={tabValue} index={0}>
+          {isGuestUser ? (
+            <Stack
+              direction={{ xs: 'column', sm: 'row' }}
+              sx={{ height: '300px', color: 'text.secondary' }}
+              alignItems='center'
+              justifyContent='center'
+            >
+              <Typography variant='body1' fontWeight={400}>
+                您的账号未激活，请点击
+              </Typography>
+              <Typography
+                variant='body1'
+                sx={{ cursor: 'pointer' }}
+                color='primary.main'
+                fontWeight={500}
+                onClick={openModal}
+              >
+                提交申请
+              </Typography>
+            </Stack>
+          ) : (
+            <UserTrendList
+              userId={user?.uid || initialUser?.uid || 0}
+              ownerName={user?.username || initialUser?.username}
+            />
+          )}
+        </TabPanel>
+        <TabPanel value={tabValue} index={1}>
+          <Stack
+            sx={{
+              '& > div': {
+                minHeight: '60px',
+                alignItems: 'center',
+                borderBottom: '1px solid',
+                borderColor: 'divider',
+                '&:last-child': {
+                  borderBottom: 'none',
+                },
+              },
+            }}
+          >
+            <Stack direction='row' alignItems='center'>
+              <Typography variant='body2' sx={{ width: '26%', color: '#666' }}>
+                昵称
+              </Typography>
+              {isEditingName ? (
+                <>
+                  <TextField
+                    value={editName}
+                    onChange={(e) => setEditName(e.target.value)}
+                    size='small'
+                    slotProps={{
+                      input: { sx: { fontSize: '13px' } },
+                    }}
+                    sx={{ flex: 1, maxWidth: 300, ml: 'auto!important', py: 0 }}
+                  />
+                  <Button onClick={handleSaveName} variant='text' size='small'>
+                    保存
+                  </Button>
+                  <Button onClick={handleCancelEdit} sx={{ color: 'rgba(33, 34, 45, 1)' }} variant='text' size='small'>
+                    取消
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Typography sx={{ flex: 1 }} variant='body2'>
+                    {user?.username || '-'}
+                  </Typography>
+                  <Button onClick={() => setIsEditingName(true)} size='small' sx={{ minWidth: 60 }}>
+                    修改
+                  </Button>
+                </>
+              )}
+            </Stack>
+
+            <Stack direction='row' alignItems='center'>
+              <Typography variant='body2' sx={{ width: '26%', color: '#666' }}>
+                介绍
+              </Typography>
+              {isEditingBio ? (
+                <>
+                  <TextField
+                    value={editBio}
+                    onChange={(e) => setEditBio(e.target.value)}
+                    size='small'
+                    slotProps={{
+                      input: { sx: { fontSize: '13px' } },
+                    }}
+                    sx={{ flex: 1, ml: 'auto!important', py: 0 }}
+                  />
+                  <Button onClick={handleSaveBio} variant='text' size='small'>
+                    保存
+                  </Button>
+                  <Button
+                    onClick={handleCancelEditBio}
+                    sx={{ color: 'rgba(33, 34, 45, 1)' }}
+                    variant='text'
+                    size='small'
+                  >
+                    取消
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Ellipsis sx={{ flex: 1, fontSize: '14px', color: 'text.primary' }}>
+                    {user?.intro || initialUser?.intro || '暂无个人介绍'}
+                  </Ellipsis>
+                  <Button onClick={() => setIsEditingBio(true)} size='small' sx={{ minWidth: 60 }}>
+                    修改
+                  </Button>
+                </>
+              )}
+            </Stack>
+
+            <Stack direction='row' alignItems='center'>
+              <Typography variant='body2' sx={{ width: '26%', color: '#666' }}>
+                邮箱
+              </Typography>
+              <Typography sx={{ flex: 1 }} variant='body2'>
+                {user?.email || '未绑定'}
+              </Typography>
+              {!user?.email ? (
+                <Button size='small' sx={{ minWidth: 60 }} onClick={() => setBindEmailModalOpen(true)}>
+                  绑定
+                </Button>
+              ) : (
+                <Button
+                  size='small'
+                  disabled
+                  sx={{
+                    minWidth: 60,
+                    color: '#999',
+                  }}
+                  title='不支持修改已绑定的邮箱'
+                >
+                  修改
+                </Button>
+              )}
+            </Stack>
+
+            <Stack direction='row' alignItems='center'>
+              <Typography variant='body2' sx={{ width: '26%', color: '#666' }}>
+                用户角色
+              </Typography>
+              <Typography variant='body2' sx={{ flex: 1 }}>
+                {roleConfig[user?.role || ModelUserRole.UserRoleUnknown].name}
+              </Typography>
+            </Stack>
+
+            <Stack direction='row' alignItems='center'>
+              <Typography variant='body2' sx={{ width: '26%', color: '#666' }}>
+                账号密码
+              </Typography>
+              <Typography sx={{ flex: 1, color: '#999' }}>••••••••</Typography>
+              {user?.builtin ? (
+                <Button
+                  size='small'
+                  disabled
+                  sx={{
+                    color: '#999',
+                  }}
+                  title='内置用户不允许修改密码'
+                >
+                  修改
+                </Button>
+              ) : (
+                <Button onClick={handleChangePasswordClick} size='small'>
+                  修改
+                </Button>
+              )}
+            </Stack>
+          </Stack>
+        </TabPanel>
+        {isAdminRole(user.role || ModelUserRole.UserRoleGuest) && (
+          <TabPanel value={tabValue} index={2}>
+            <QuickReplyList />
+          </TabPanel>
+        )}
+        <TabPanel value={tabValue} index={isAdminRole(user.role || ModelUserRole.UserRoleGuest) ? 3 : 2}>
+          {isGuestUser ? (
+            <Stack
+              direction={{ xs: 'column', sm: 'row' }}
+              sx={{ height: '300px', color: 'text.secondary' }}
+              alignItems='center'
+              justifyContent='center'
+            >
+              <Typography variant='body1' fontWeight={400}>
+                您的账号未激活，请点击
+              </Typography>
+              <Typography
+                variant='body1'
+                sx={{ cursor: 'pointer' }}
+                color='primary.main'
+                fontWeight={500}
+                onClick={openModal}
+              >
+                提交申请
+              </Typography>
+            </Stack>
+          ) : (
+            <FollowingIssuesList />
+          )}
+        </TabPanel>
+        <TabPanel value={tabValue} index={4}>
+          <NotificationCenter />
+        </TabPanel>
+        {isCurrentUser && (
+          <TabPanel value={tabValue} index={5}>
+            <UserPointList userId={user?.uid || initialUser?.uid || 0} />
+          </TabPanel>
+        )}
+      </Box>
+
+      {/* 修改密码模态框 */}
+      <ChangePasswordModal
+        open={changePasswordModalOpen}
+        onClose={() => setChangePasswordModalOpen(false)}
+        onSuccess={() => {
+          // 密码修改成功
+        }}
+        user={user}
+      />
+
+      {/* 绑定邮箱模态框 */}
+      <BindEmailModal
+        open={bindEmailModalOpen}
+        onClose={() => setBindEmailModalOpen(false)}
+        onSuccess={async () => {
+          // 绑定邮箱成功后，重新获取用户信息
+          await fetchUser()
+        }}
+      />
+    </Box>
+  )
+}

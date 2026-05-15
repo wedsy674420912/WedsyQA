@@ -1,0 +1,208 @@
+package model
+
+import (
+	"errors"
+	"strconv"
+	"strings"
+
+	"github.com/chaitin/koalaqa/pkg/anydoc/platform"
+)
+
+type DocStatus uint
+
+const (
+	DocStatusUnknown DocStatus = iota
+	DocStatusApplySuccess
+	DocStatusPendingReview
+	DocStatusPendingApply
+	DocStatusApplyFailed
+	DocStatusAppling
+	DocStatusPendingExport
+	DocStatusExportSuccess
+	DocStatusExportFailed
+	DocStatusPendingExec
+)
+
+type DocType uint
+
+const (
+	DocTypeUnknown DocType = iota
+	DocTypeQuestion
+	DocTypeDocument
+	DocTypeSpace
+	DocTypeWeb
+)
+
+type FileType uint
+
+const (
+	FileTypeUnknown FileType = iota
+	FileTypeMarkdown
+	FileTypeHTML
+	FileTypeJSON
+	FileTypeURL
+	FileTypeDOCX
+	FileTypeDOC
+	FileTypePPTX
+	FileTypeXLSX
+	FileTypeXLS
+	FileTypePDF
+	FileTypeImage
+	FileTypeCSV
+	FileTypeXML
+	FileTypeZIP
+	FileTypeEPub
+	FileTypeFolder // 文件夹
+	FileTypeFile   // 未知文件类型
+	FileTypeMax
+)
+
+type PlatformOpt struct {
+	URL          string `json:"url,omitempty"`
+	AppID        string `json:"app_id,omitempty"`
+	Secret       string `json:"secret,omitempty"`
+	AccessToken  string `json:"access_token,omitempty"`
+	RefreshToken string `json:"refresh_token,omitempty"`
+	Username     string `json:"username,omitempty"`
+	UserThirdID  string `json:"user_third_id,omitempty"`
+	Phone        string `json:"phone,omitempty"`
+}
+
+type ExportFolder struct {
+	FolderID string   `json:"folder_id"`
+	DocIDs   []string `json:"doc_ids"`
+}
+
+type ExportOpt struct {
+	SpaceID  string `json:"space_id,omitempty"`
+	FileType string `json:"file_type,omitempty"`
+
+	// 需要导出的文档
+	Folders []ExportFolder `json:"folders,omitempty"`
+}
+
+type KBDocument struct {
+	Base
+
+	KBID         uint                  `json:"kb_id" gorm:"column:kb_id;index"`
+	RagID        string                `json:"rag_id" gorm:"column:rag_id;index"`
+	Platform     platform.PlatformType `json:"platform" gorm:"column:platform"`
+	PlatformOpt  JSONB[PlatformOpt]    `json:"platform_opt" gorm:"column:platform_opt;type:jsonb"`
+	ExportOpt    JSONB[ExportOpt]      `json:"export_opt" gorm:"column:export_opt;type:jsonb"`
+	ExportTaskID string                `json:"export_task_id" gorm:"column:export_task_id;type:text;uniqueIndex;default:null"`
+	DocID        string                `json:"doc_id" gorm:"column:doc_id;type:text"`
+	Title        string                `json:"title" gorm:"column:title;type:text"`
+	Desc         string                `json:"desc" gorm:"column:desc;type:text"`
+	Markdown     []byte                `json:"markdown" gorm:"column:markdown;type:bytea"`
+	JSON         []byte                `json:"json" gorm:"column:json;type:bytea"`
+	FileType     FileType              `json:"file_type" gorm:"column:file_type"`
+	DocType      DocType               `json:"doc_type" gorm:"column:doc_type"`
+	Status       DocStatus             `json:"status" gorm:"column:status"`
+	ParentID     uint                  `json:"parent_id" gorm:"column:parent_id;type:bigint;default:0"`
+	RootParentID uint                  `json:"root_parent_id" gorm:"column:root_parent_id;type:bigint;default:0"`
+	SimilarID    uint                  `json:"similar_id" gorm:"column:similar_id;type:bigint;default:0"`
+	Message      string                `json:"message" gorm:"column:message;type:text"`
+	GroupIDs     Int64Array            `json:"group_ids" gorm:"column:group_ids;type:bigint[]"`
+	ExportAt     Timestamp             `json:"export_at" gorm:"type:timestamp with time zone"`
+}
+
+func (d *KBDocument) QuestionDiscID() (uint, error) {
+	if d.DocType != DocTypeQuestion || d.Desc == "" {
+		return 0, nil
+	}
+
+	splitDesc := strings.Split(d.Desc, "/")
+	if len(splitDesc) != 2 {
+		return 0, errors.New("invalid desc format")
+	}
+
+	discID, err := strconv.ParseUint(splitDesc[0], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	return uint(discID), nil
+}
+
+func (d *KBDocument) Metadata() KBDocMetadata {
+	return KBDocMetadata{
+		DocType:  d.DocType,
+		Platform: d.Platform,
+		FileType: d.FileType,
+		GroupIDs: d.GroupIDs,
+	}
+}
+
+type KBDocMetadata struct {
+	DocType  DocType               `json:"doc_type,omitempty"`
+	Platform platform.PlatformType `json:"platform,omitempty"`
+	FileType FileType              `json:"file_type,omitempty"`
+	GroupIDs Int64Array            `json:"group_ids,omitempty"`
+}
+
+func (d KBDocMetadata) Map() map[string]any {
+	result := make(map[string]any)
+
+	if d.DocType != DocTypeUnknown {
+		result["doc_type"] = d.DocType
+	}
+
+	if d.FileType != FileTypeUnknown {
+		result["file_type"] = d.FileType
+	}
+
+	if d.Platform != platform.PlatformUnknown {
+		result["platform"] = d.Platform
+	}
+
+	if len(d.GroupIDs) > 0 {
+		result["group_ids"] = d.GroupIDs
+	}
+
+	return result
+}
+
+type CreateSpaceFolderInfo struct {
+	DocID    string                   `json:"doc_id"`
+	File     bool                     `json:"file"`
+	Title    string                   `json:"title"`
+	FileType string                   `json:"file_type"`
+	Children []*CreateSpaceFolderInfo `json:"children"`
+}
+
+func (c *CreateSpaceFolderInfo) Range(parentID string, f func(string, *CreateSpaceFolderInfo) error) error {
+	if c == nil {
+		return nil
+	}
+
+	err := f(parentID, c)
+	if err != nil {
+		return err
+	}
+
+	for _, child := range c.Children {
+		pID := c.DocID
+		if pID == "" {
+			pID = parentID
+		}
+
+		err = child.Range(pID, f)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+type KBDocumentDetail struct {
+	KBDocument
+	DiscForumID uint   `json:"disc_forum_id" gorm:"-"`
+	DiscUUID    string `json:"disc_uuid" gorm:"-"`
+	Markdown    string `json:"markdown"`
+	JSON        string `json:"json"`
+}
+
+func init() {
+	registerAutoMigrate(&KBDocument{})
+}

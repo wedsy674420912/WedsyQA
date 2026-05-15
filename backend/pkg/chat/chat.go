@@ -1,0 +1,138 @@
+package chat
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/chaitin/koalaqa/model"
+	"github.com/chaitin/koalaqa/pkg/llm"
+	"golang.org/x/sync/singleflight"
+)
+
+var sf singleflight.Group
+
+type token struct {
+	token    string
+	expireAt time.Time
+}
+
+func (d *token) expired() bool {
+	return d.token == "" || time.Now().After(d.expireAt.Add(-time.Minute*5))
+}
+
+type streamState struct {
+	mutex  sync.Mutex
+	stream strings.Builder
+	Done   bool
+}
+
+func newSteamState() *streamState {
+	return &streamState{
+		mutex:  sync.Mutex{},
+		stream: strings.Builder{},
+		Done:   false,
+	}
+}
+
+func (s *streamState) Append(data string, done bool) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	if data != "" {
+		s.stream.WriteString(data)
+	}
+
+	if done {
+		s.Done = done
+	}
+}
+
+func (s *streamState) Text() string {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	return s.stream.String()
+}
+
+type StateManager struct {
+	cache sync.Map
+}
+
+func (s *StateManager) Get(key string) (*streamState, bool) {
+	val, ok := s.cache.Load(key)
+	if !ok {
+		return nil, false
+	}
+
+	return val.(*streamState), true
+}
+
+func (s *StateManager) Set(key string, state *streamState) {
+	s.cache.Store(key, state)
+}
+
+func (s *StateManager) Delete(key string) {
+	s.cache.Delete(key)
+}
+
+func newStateManager() *StateManager {
+	return &StateManager{
+		cache: sync.Map{},
+	}
+}
+
+type Type uint
+
+const (
+	TypeUnknown Type = iota
+	TypeDingtalk
+	TypeWecom
+	TypeWecomIntelligent
+	TypeWecomService
+)
+
+type BotReq struct {
+	Type      Type   `json:"-"`
+	SessionID string `json:"session_id"`
+	Question  string `json:"question"`
+}
+
+type BotCallback func(ctx context.Context, req BotReq) (*llm.Stream[string], error)
+
+type VerifySign struct {
+	MsgSignature string `form:"msg_signature" binding:"required"`
+	Timestamp    string `form:"timestamp" binding:"required"`
+	Nonce        string `form:"nonce" binding:"required"`
+}
+
+type VerifyReq struct {
+	VerifySign
+
+	Content    string
+	OnlyVerify bool
+}
+
+type Bot interface {
+	Start() error
+	StreamText(context.Context, VerifyReq) (string, error)
+	Stop()
+}
+
+func New(typ Type, cfg model.SystemChatConfig, callback BotCallback,
+	accessAddrCallback model.AccessAddrCallback, enabledCallback model.EnabledCallback) (Bot, error) {
+	switch typ {
+	case TypeDingtalk:
+		return newDingtalk(cfg, callback)
+	case TypeWecom:
+		return newWecom(cfg, callback)
+	case TypeWecomIntelligent:
+		return newWecomIntelligent(cfg, callback)
+	case TypeWecomService:
+		return newWecomService(cfg, callback, accessAddrCallback, enabledCallback)
+	default:
+		return nil, errors.ErrUnsupported
+	}
+}

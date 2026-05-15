@@ -1,0 +1,699 @@
+package svc
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/chaitin/koalaqa/model"
+	"github.com/chaitin/koalaqa/pkg/config"
+	"github.com/chaitin/koalaqa/pkg/glog"
+	"github.com/chaitin/koalaqa/pkg/llm"
+	"github.com/chaitin/koalaqa/pkg/rag"
+	"github.com/chaitin/koalaqa/pkg/util"
+	"github.com/chaitin/koalaqa/repo"
+	"github.com/cloudwego/eino/components/prompt"
+	"github.com/cloudwego/eino/schema"
+)
+
+type LLM struct {
+	rag     rag.Service
+	dataset *repo.Dataset
+	logger  *glog.Logger
+	doc     *repo.KBDocument
+	kit     *ModelKit
+	cfg     config.Config
+	disc    *repo.Discussion
+	comm    *repo.Comment
+	bot     *Bot
+	repoLLM *repo.LLM
+}
+
+func newLLM(rag rag.Service, dataset *repo.Dataset, doc *repo.KBDocument, kit *ModelKit, bot *Bot,
+	cfg config.Config, disc *repo.Discussion, comm *repo.Comment, repoLLM *repo.LLM) *LLM {
+	return &LLM{
+		rag:     rag,
+		dataset: dataset,
+		logger:  glog.Module("llm"),
+		doc:     doc,
+		kit:     kit,
+		cfg:     cfg,
+		disc:    disc,
+		comm:    comm,
+		bot:     bot,
+		repoLLM: repoLLM,
+	}
+}
+
+func init() {
+	registerSvc(newLLM)
+}
+
+type GenerateContextItem struct {
+	Bot     bool   `json:"bot"`
+	Content string `json:"content"`
+}
+
+type GenerateReq struct {
+	Context       []GenerateContextItem `json:"context"`
+	Question      string                `json:"question"`
+	Groups        []model.GroupItemInfo `json:"groups"`
+	Prompt        string                `json:"prompt"`
+	DefaultAnswer string                `json:"default_answer"`
+	NewCommentID  uint                  `json:"new_comment_id"`
+	Debug         bool                  `json:"debug"`
+}
+
+type GroupRouteOption struct {
+	ID        uint   `json:"id"`
+	GroupID   uint   `json:"group_id"`
+	Name      string `json:"name"`
+	GroupName string `json:"group_name"`
+}
+
+func (g *GenerateReq) Histories() []*schema.Message {
+	res := make([]*schema.Message, len(g.Context))
+	for i := range g.Context {
+		role := schema.User
+		if g.Context[i].Bot {
+			role = schema.Assistant
+		}
+		res[i] = &schema.Message{
+			Role:    role,
+			Content: g.Context[i].Content,
+		}
+	}
+
+	return res
+}
+
+func (g *GenerateReq) GroupInfo() (ids model.Int64Array, names []string) {
+	for _, item := range g.Groups {
+		ids = append(ids, int64(item.ID))
+		names = append(names, item.Name)
+	}
+
+	return
+}
+
+func (l *LLM) RouteGroups(ctx context.Context, question string, options []GroupRouteOption) ([]int64, error) {
+	question = strings.TrimSpace(question)
+	if question == "" || len(options) == 0 {
+		return nil, nil
+	}
+
+	res, err := l.Chat(ctx, llm.SystemGroupRoutePrompt, question, map[string]any{
+		"GroupOptions": options,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var parsed struct {
+		ItemIDs []int64 `json:"item_ids"`
+	}
+	if err := json.Unmarshal([]byte(res), &parsed); err != nil {
+		l.logger.WithContext(ctx).
+			WithErr(err).
+			With("raw", res).
+			Warn("route groups response parse failed")
+		return nil, err
+	}
+
+	ids := parsed.ItemIDs
+	if len(ids) > 3 {
+		ids = ids[:3]
+	}
+
+	return ids, nil
+}
+
+func (l *LLM) StreamAnswer(ctx context.Context, sysPrompt string, req GenerateReq) (*llm.Stream[string], error) {
+	query := req.Question
+
+	groupIDs, groupNames := req.GroupInfo()
+
+	if len(groupNames) > 0 {
+		query += "\n" + strings.Join(groupNames, ",")
+	}
+
+	chatHistoies := make([]string, 0)
+	for _, v := range req.Context {
+		if v.Bot {
+			continue
+		}
+
+		chatHistoies = append(chatHistoies, v.Content)
+	}
+
+	rewrittenQuery, knowledgeDocuments, err := l.queryKnowledgeDocuments(ctx, query, model.KBDocMetadata{
+		GroupIDs: groupIDs,
+	}, chatHistoies...)
+	if err != nil {
+		return nil, err
+	}
+
+	botInfo, err := l.bot.Get(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	blockKeywords := ""
+	cursor := botInfo.MatcherCursor()
+	if botInfo.KeywordsEnable && cursor == nil {
+		blockKeywords = botInfo.Keywords
+	}
+
+	filterStream := llm.NewStream[string]()
+
+	stream, err := l.StreamChat(ctx, sysPrompt, req.Prompt, map[string]any{
+		"Question":           rewrittenQuery,
+		"NewCommentID":       req.NewCommentID,
+		"CurrentDate":        time.Now().Format("2006-01-02"),
+		"DefaultAnswer":      req.DefaultAnswer,
+		"KnowledgeDocuments": knowledgeDocuments,
+		"Debug":              req.Debug,
+		"BlockKeywords":      blockKeywords,
+		"GeneralKnowledge":   botInfo.GeneralKnowledge,
+	}, req.Histories()...)
+	if err != nil {
+		return nil, err
+	}
+
+	go func() {
+		defer stream.Close()
+
+		runes := make([]rune, 0)
+		filterStream.Recv(func() (string, error) {
+			msg, _, ok := stream.Text(ctx)
+			if !ok {
+				if len(runes) > 0 {
+					data := string(runes)
+					runes = runes[:0]
+					return data, nil
+				}
+				return "", errStreaming
+			}
+
+			if cursor != nil {
+				resMsg := ""
+				for _, s := range msg {
+					cursor.Append(s)
+					runes = append(runes, s)
+					if cursor.Failed() {
+						index := len(runes) - cursor.Depth()
+						data := string(runes[:index])
+						runes = runes[index:]
+						resMsg += data
+					}
+					if cursor.IsKeyword() {
+						resMsg += strings.Repeat(".", cursor.Depth())
+						cursor.Clear()
+						runes = runes[:0]
+					}
+				}
+
+				return resMsg, nil
+			}
+
+			return msg, nil
+		})
+
+	}()
+
+	return filterStream, nil
+}
+
+func (l *LLM) answer(ctx context.Context, sysPrompt string, req GenerateReq) (string, bool, []string, error) {
+	query := req.Question
+
+	groupIDs, groupNames := req.GroupInfo()
+
+	if len(groupNames) > 0 {
+		query += "\n" + strings.Join(groupNames, ",")
+	}
+
+	botInfo, err := l.bot.Get(ctx)
+	if err != nil {
+		return "", false, nil, err
+	}
+
+	rewrittenQuery, knowledgeDocuments, err := l.queryKnowledgeDocuments(ctx, query, model.KBDocMetadata{
+		GroupIDs: groupIDs,
+	})
+	if err != nil {
+		return "", false, nil, err
+	}
+
+	blockKeywords := ""
+	cursor := botInfo.MatcherCursor()
+	if botInfo.KeywordsEnable && cursor == nil {
+		blockKeywords = botInfo.Keywords
+	}
+
+	res, err := l.Chat(ctx, sysPrompt, req.Prompt, map[string]any{
+		"Question":           rewrittenQuery,
+		"NewCommentID":       req.NewCommentID,
+		"CurrentDate":        time.Now().Format("2006-01-02"),
+		"KnowledgeDocuments": knowledgeDocuments,
+		"BlockKeywords":      blockKeywords,
+		"GeneralKnowledge":   botInfo.GeneralKnowledge,
+	})
+	if err != nil {
+		return "", false, nil, err
+	}
+
+	// 解析 JSON 响应
+	resp, err := llm.ParseChatResponse(res)
+	if err != nil {
+		l.logger.WithContext(ctx).WithErr(err).With("raw", res).Error("llm response parse failed")
+		return "", false, nil, err
+	}
+	l.logger.WithContext(ctx).
+		With("matched", resp.Matched).
+		With("reason", resp.Reason).
+		Info("llm response parsed")
+	if !resp.Matched || resp.Answer == "" {
+		return req.DefaultAnswer, false, nil, nil
+	}
+
+	if cursor != nil {
+		var (
+			builder strings.Builder
+		)
+
+		runes := make([]rune, 0)
+		for _, s := range resp.Answer {
+			cursor.Append(s)
+			runes = append(runes, s)
+			if cursor.Failed() {
+				index := len(runes) - cursor.Depth()
+				data := string(runes[:index])
+				builder.WriteString(data)
+				runes = runes[index:]
+			}
+			if cursor.IsKeyword() {
+				builder.WriteString(strings.Repeat(".", cursor.Depth()))
+				cursor.Clear()
+				runes = runes[:0]
+			}
+		}
+		if len(runes) > 0 {
+			builder.WriteString(string(runes))
+		}
+
+		resp.Answer = builder.String()
+	}
+
+	if botInfo.AnswerRef && len(resp.Sources) > 0 {
+		resp.Answer += "\n\n---\n\n" + "引用来源: "
+		for i, source := range resp.Sources {
+			resp.Answer += fmt.Sprintf(`<span data-tooltip="<h3>来源</h3><br>%s">[%d]</span> `, source.Title, i+1)
+		}
+	}
+
+	docM := make(map[string]bool)
+	for _, doc := range knowledgeDocuments {
+		docM[doc.Source] = true
+	}
+
+	refID := make([]string, 0)
+	for _, source := range resp.Sources {
+		if !docM[source.ID] {
+			continue
+		}
+
+		refID = append(refID, source.ID)
+	}
+
+	return resp.Answer, true, refID, nil
+}
+
+func (l *LLM) Answer(ctx context.Context, req GenerateReq) (string, bool, []string, error) {
+	return l.answer(ctx, llm.SystemChatPrompt, req)
+}
+
+func (l *LLM) AnswerWithThink(ctx context.Context, req GenerateReq) (string, bool, []string, error) {
+	return l.answer(ctx, llm.SystemChatWithThinkPrompt, req)
+}
+
+var tokenLimitKeywords = []string{
+	"reduce the length",
+	"must have less than",
+	"token limit",
+	"tokens exceeded",
+	"context length",
+	"maximum context",
+	"too many tokens",
+	"input is too long",
+	"exceeds the maximum",
+	"max_tokens is invalid",
+	"prompt_tokens is invalid",
+}
+
+func (l *LLM) IsTokenLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	return util.StringContainsAny(err.Error(), tokenLimitKeywords)
+}
+
+// updateChatModelStatus 更新智能对话模型的状态
+func (l *LLM) updateChatModelStatus(ctx context.Context, status model.LLMStatus, message string) {
+	logger := l.logger.WithContext(ctx)
+
+	// 获取智能对话模型
+	chatModel, err := l.repoLLM.GetChatModel(ctx)
+	if err != nil {
+		logger.WithErr(err).Warn("get chat model failed when updating status")
+		return
+	}
+
+	// 更新状态
+	err = l.repoLLM.Update(ctx, map[string]any{
+		"status":     status,
+		"message":    message,
+		"updated_at": time.Now(),
+	}, repo.QueryWithEqual("id", chatModel.ID))
+
+	if err != nil {
+		logger.WithErr(err).Warn("update chat model status failed")
+	} else {
+		logger.With("status", status, "model_id", chatModel.ID).Info("chat model status updated")
+	}
+}
+
+func (l *LLM) Chat(ctx context.Context, sMsg string, uMsg string, params map[string]any) (string, error) {
+	cm, err := l.kit.GetChatModel(ctx)
+	if err != nil {
+		return "", err
+	}
+	logger := l.logger.WithContext(ctx)
+
+	msgs, err := l.msgs(ctx, sMsg, uMsg, params)
+	if err != nil {
+		return "", err
+	}
+
+	logger.Debug("wait llm response")
+	res, err := cm.Generate(ctx, msgs)
+	if err != nil {
+		logger.WithErr(err).Error("llm response failed")
+		// 更新模型状态为错误
+		l.updateChatModelStatus(ctx, model.LLMStatusError, err.Error())
+		return "", err
+	}
+
+	// 调用成功，更新模型状态为正常
+	l.updateChatModelStatus(ctx, model.LLMStatusNormal, "")
+
+	logger.With("response", res.Content).Debug("llm response success")
+	return res.Content, nil
+}
+
+func (l *LLM) msgs(ctx context.Context, sMsg string, uMsg string, params map[string]any) ([]*schema.Message, error) {
+	if params == nil {
+		params = make(map[string]any)
+	}
+	templates := []schema.MessagesTemplate{
+		schema.SystemMessage(sMsg),
+	}
+	if uMsg != "" {
+		params["Context"] = uMsg
+		templates = append(templates, schema.UserMessage(llm.UserMsgFormat))
+	}
+	template := prompt.FromMessages(schema.GoTemplate, templates...)
+	msgs, err := template.Format(ctx, params)
+	if err != nil {
+		return nil, err
+	}
+	for _, msg := range msgs {
+		l.logger.With("role", msg.Role).WithText("content", msg.Content).Debug("format message")
+	}
+
+	return msgs, nil
+}
+
+func (l *LLM) StreamChat(ctx context.Context, sMsg string, uMsg string, params map[string]any, histories ...*schema.Message) (*llm.Stream[string], error) {
+	cm, err := l.kit.GetChatModel(ctx)
+	if err != nil {
+		return nil, err
+	}
+	logger := l.logger.WithContext(ctx)
+
+	msgs, err := l.msgs(ctx, sMsg, uMsg, params)
+	if err != nil {
+		return nil, err
+	}
+
+	logger.Debug("wait llm stream response")
+	reader, err := cm.Stream(ctx, slices.Insert(msgs, 1, histories...))
+	if err != nil {
+		// 更新模型状态为错误
+		l.updateChatModelStatus(ctx, model.LLMStatusError, err.Error())
+		return nil, err
+	}
+	l.updateChatModelStatus(ctx, model.LLMStatusNormal, "")
+	s := llm.NewStream[string]()
+
+	go func() {
+		defer reader.Close()
+
+		s.Recv(func() (string, error) {
+			msg, err := reader.Recv()
+			if err != nil {
+				return "", err
+			}
+
+			return msg.Content, nil
+		})
+
+	}()
+
+	return s, nil
+}
+
+// discussionTemplateOpts 控制构建讨论提示词模板的行为
+type discussionTemplateOpts struct {
+	// CommID 触发回复的新评论 ID，为 0 时不加载新评论
+	CommID uint
+	// LoadComments 是否加载该讨论的全部评论列表
+	LoadComments bool
+}
+
+// buildDiscussionTemplate 统一构建讨论提示词模板的内部方法
+func (l *LLM) buildDiscussionTemplate(ctx context.Context, discID uint, opts discussionTemplateOpts) (*llm.DiscussionPromptTemplate, error) {
+	discussion, err := l.disc.Detail(ctx, 0, discID)
+	if err != nil {
+		return nil, fmt.Errorf("get discussion detail failed: %w", err)
+	}
+
+	var allComments []model.CommentDetail
+	if opts.LoadComments {
+		err = l.comm.List(ctx, &allComments,
+			repo.QueryWithEqual("discussion_id", discID),
+			repo.QueryWithOrderBy("created_at ASC"),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("get discussion comments failed: %w", err)
+		}
+	}
+
+	var newComment *model.CommentDetail
+	if opts.CommID > 0 {
+		newComment, err = l.comm.Detail(ctx, opts.CommID)
+		if err != nil {
+			return nil, fmt.Errorf("get new comment detail failed: %w", err)
+		}
+	}
+
+	return llm.NewDiscussionPromptTemplate(discussion, allComments, newComment), nil
+}
+
+// PromptMode 控制 GeneratePrompt 的行为
+type PromptMode int
+
+const (
+	// PromptModeAnswer 回答模式：加载全部评论及新评论，返回 Question/Groups/Content
+	PromptModeAnswer PromptMode = iota
+	// PromptModeAnswerNoComments 回答模式（不含评论）：不加载评论，返回 Question/Groups/Content
+	PromptModeAnswerNoComments
+	// PromptModeRetrieval 检索模式：加载全部评论，返回 Content
+	PromptModeRetrieval
+	// PromptModeRetrievalNoComments 无评论检索模式：不加载评论，返回 Content
+	PromptModeRetrievalNoComments
+)
+
+// GeneratePromptOpts GeneratePrompt 的参数
+type GeneratePromptOpts struct {
+	Mode    PromptMode
+	DiscIDs []uint // 单帖模式取第一个，批量模式取全部
+	CommID  uint   // 仅 PromptModeAnswer 时使用
+}
+
+// PromptResult GeneratePrompt 的返回值，按 Mode 不同，部分字段可能为零值
+type PromptResult struct {
+	Question string
+	Content  string
+	Groups   []model.GroupItemInfo
+}
+
+// GeneratePrompt 统一生成讨论相关提示词或检索内容。
+// DiscIDs 传入多个时自动进入批量模式，加载各帖子评论后合并渲染，返回 Content。
+func (l *LLM) GeneratePrompt(ctx context.Context, opts GeneratePromptOpts) (PromptResult, error) {
+	logger := l.logger.WithContext(ctx).With("mode", opts.Mode, "disc_ids", opts.DiscIDs)
+	logger.Debug("start generate prompt")
+
+	if len(opts.DiscIDs) > 1 {
+		var discTemplates llm.DiscussionPromptTemplates
+		for _, discID := range opts.DiscIDs {
+			t, err := l.buildDiscussionTemplate(ctx, discID, discussionTemplateOpts{LoadComments: true})
+			if err != nil {
+				logger.WithErr(err).With("disc_id", discID).Warn("get discussion prompt failed")
+				continue
+			}
+			discTemplates = append(discTemplates, *t)
+		}
+		if len(discTemplates) == 0 {
+			logger.Warn("discs not found")
+			return PromptResult{}, nil
+		}
+		content, err := discTemplates.BuildFullPrompt()
+		if err != nil {
+			return PromptResult{}, err
+		}
+		return PromptResult{Content: content}, nil
+	}
+
+	if len(opts.DiscIDs) == 0 {
+		return PromptResult{}, fmt.Errorf("DiscIDs is required")
+	}
+	discID := opts.DiscIDs[0]
+
+	templateOptsMap := map[PromptMode]discussionTemplateOpts{
+		PromptModeAnswer:              {CommID: opts.CommID, LoadComments: true},
+		PromptModeAnswerNoComments:    {},
+		PromptModeRetrieval:           {LoadComments: true},
+		PromptModeRetrievalNoComments: {},
+	}
+	t, err := l.buildDiscussionTemplate(ctx, discID, templateOptsMap[opts.Mode])
+	if err != nil {
+		return PromptResult{}, err
+	}
+
+	var result PromptResult
+	switch opts.Mode {
+	case PromptModeAnswer:
+		result.Question = t.Question()
+		result.Groups = t.Discussion.GroupInfo()
+		result.Content, err = t.BuildFullPrompt()
+	case PromptModeAnswerNoComments:
+		result.Question = t.Question()
+		result.Groups = t.Discussion.GroupInfo()
+		result.Content, err = t.BuildFullPrompt()
+	case PromptModeRetrieval, PromptModeRetrievalNoComments:
+		result.Content = t.BuildContentForRetrieval()
+	}
+	if err != nil {
+		return PromptResult{}, fmt.Errorf("generate prompt failed: %w", err)
+	}
+
+	logger.Debug("generate prompt success")
+	return result, nil
+}
+
+// queryKnowledgeDocuments 查询相关知识文档
+func (l *LLM) queryKnowledgeDocuments(ctx context.Context, query string, metadata rag.Metadata, histories ...string) (string, []llm.KnowledgeDocument, error) {
+	logger := l.logger.WithContext(ctx)
+
+	logger.With("query", query).Debug("query knowledge documents")
+
+	// 使用RAG服务查询相关文档
+	rewrittenQuery, records, err := l.rag.QueryRecords(ctx, rag.QueryRecordsReq{
+		DatasetID: l.dataset.GetBackendID(ctx),
+		Query:     query,
+		Metadata:  metadata,
+		Histories: histories,
+	})
+	if err != nil {
+		return "", nil, fmt.Errorf("RAG query failed: %w", err)
+	}
+	docContent := make(map[string]string)
+	for _, ragRecord := range records {
+		docContent[ragRecord.DocID] += "\n" + ragRecord.Content
+	}
+	var (
+		ragIDs []string
+		ragIDM = make(map[string]struct{})
+	)
+	for _, record := range records {
+		ragIDs = append(ragIDs, record.DocID)
+		ragIDM[record.DocID] = struct{}{}
+	}
+	logger.With("rag_ids", ragIDs).Debug("RAG query success")
+	docs, err := l.doc.GetByRagIDs(ctx, ragIDs)
+	if err != nil {
+		return "", nil, fmt.Errorf("get document detail failed: %w", err)
+	}
+
+	for _, doc := range docs {
+		delete(ragIDM, doc.RagID)
+	}
+
+	if len(ragIDM) > 0 {
+		deleteRagIDs := make([]string, 0, len(ragIDM))
+		for ragID := range ragIDM {
+			deleteRagIDs = append(deleteRagIDs, ragID)
+		}
+
+		err = l.rag.DeleteRecords(ctx, l.dataset.GetBackendID(ctx), deleteRagIDs)
+		if err != nil {
+			logger.WithErr(err).With("rag_ids", deleteRagIDs).Warn("delete not exist rag failed")
+		}
+	}
+
+	knowledgeDocs := make([]llm.KnowledgeDocument, 0, len(docs))
+	for _, doc := range docs {
+		content := docContent[doc.RagID]
+		if doc.DocType == model.DocTypeQuestion {
+			content = string(doc.Markdown)
+		}
+		knowledgeDocs = append(knowledgeDocs, llm.KnowledgeDocument{
+			Title:   doc.Title,
+			Content: content,
+			Source:  strconv.Itoa(int(doc.ID)),
+			QA:      doc.DocType == model.DocTypeQuestion,
+		})
+	}
+	return rewrittenQuery, knowledgeDocs, nil
+}
+
+type PolishReq struct {
+	Text string `json:"text"`
+}
+
+func (l *LLM) Polish(ctx context.Context, req PolishReq) (string, error) {
+	res, err := l.Chat(ctx, llm.PolishTextPrompt, req.Text, nil)
+	if err != nil {
+		return "", err
+	}
+	return res, nil
+}
+
+type UpdatePromptReq struct {
+	Prompt string `json:"prompt"`
+}
+
+func (l *LLM) UpdateSystemChatPrompt(ctx context.Context, req UpdatePromptReq) error {
+	llm.SystemChatPrompt = req.Prompt
+	return nil
+}
+
+func (l *LLM) GetSystemChatPrompt(ctx context.Context) (string, error) {
+	return llm.SystemChatPrompt, nil
+}

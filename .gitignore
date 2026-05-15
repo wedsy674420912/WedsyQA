@@ -1,0 +1,23 @@
+.vscode/
+
+__debug*
+
+*.glog
+
+backend/deploy/data
+**/node_modules/
+
+*.local.yaml
+
+.env
+
+data/
+
+# macOS system files
+.DS_Store
+
+sync_prompt.py
+sync_remote.sh
+
+backend/deploy/
+.opencode/rcl

@@ -1,0 +1,320 @@
+package sub
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/chaitin/koalaqa/model"
+	"github.com/chaitin/koalaqa/pkg/batch"
+	"github.com/chaitin/koalaqa/pkg/database"
+	"github.com/chaitin/koalaqa/pkg/glog"
+	"github.com/chaitin/koalaqa/pkg/mq"
+	"github.com/chaitin/koalaqa/pkg/topic"
+	"github.com/chaitin/koalaqa/pkg/util"
+	"github.com/chaitin/koalaqa/repo"
+	"github.com/chaitin/koalaqa/svc"
+)
+
+type Disc struct {
+	disc    *svc.Discussion
+	trend   *svc.Trend
+	logger  *glog.Logger
+	llm     *svc.LLM
+	bot     *svc.Bot
+	pub     mq.Publisher
+	stat    *repo.Stat
+	batcher batch.Batcher[model.StatInfo]
+}
+
+func NewDisc(disc *svc.Discussion, llm *svc.LLM, bot *svc.Bot, stat *repo.Stat,
+	pub mq.Publisher, trend *svc.Trend, batcher batch.Batcher[model.StatInfo]) *Disc {
+	return &Disc{
+		disc:    disc,
+		trend:   trend,
+		llm:     llm,
+		bot:     bot,
+		pub:     pub,
+		batcher: batcher,
+		stat:    stat,
+		logger:  glog.Module("sub.discussion.change"),
+	}
+}
+
+func (d *Disc) MsgType() mq.Message {
+	return topic.MsgDiscChange{}
+}
+
+func (d *Disc) Topic() mq.Topic {
+	return topic.TopicDiscChange
+}
+
+func (d *Disc) Group() string {
+	return "koala_discussion_change"
+}
+
+func (d *Disc) AckWait() time.Duration {
+	return time.Minute * 5
+}
+
+func (d *Disc) Concurrent() uint {
+	return 10
+}
+
+func (d *Disc) Handle(ctx context.Context, msg mq.Message) error {
+	data := msg.(topic.MsgDiscChange)
+	if data.Type != model.DiscussionTypeQA {
+		d.logger.WithContext(ctx).
+			With("disc_uuid", data.DiscUUID).
+			With("type", data.Type).
+			Debug("discussion type is not qa, skip")
+		return nil
+	}
+	switch data.OP {
+	case topic.OPInsert:
+		return d.handleInsert(ctx, data)
+	case topic.OPUpdate:
+		return d.handleUpdate(ctx, data)
+	case topic.OPDelete:
+		return d.handleDelete(ctx, data)
+	}
+	return nil
+
+}
+
+func (d *Disc) handleInsert(ctx context.Context, data topic.MsgDiscChange) error {
+	logger := d.logger.WithContext(ctx).With("disc_id", data.DiscID)
+	logger.Info("handle insert discussion comment")
+
+	bot, err := d.bot.Get(ctx)
+	if err != nil {
+		logger.WithErr(err).Error("get bot failed")
+		return nil
+	}
+
+	disc, err := d.disc.GetByID(ctx, data.DiscID)
+	if err != nil {
+		if errors.Is(err, database.ErrRecordNotFound) {
+			logger.Info("discussion not found, skip")
+			return nil
+		}
+
+		logger.WithErr(err).Error("get discussion failed")
+		return err
+	}
+
+	err = d.pub.Publish(ctx, topic.TopicHotQuestion, topic.MsgHotQuestion{
+		Content:  disc.Title,
+		DiscUUID: disc.UUID,
+	})
+	if err != nil {
+		logger.WithErr(err).Warn("pub hot question failed")
+	}
+
+	answerRes, err := d.llm.GeneratePrompt(ctx, svc.GeneratePromptOpts{Mode: svc.PromptModeAnswerNoComments, DiscIDs: []uint{data.DiscID}})
+	if err != nil {
+		logger.WithErr(err).Error("generate prompt failed")
+		return nil
+	}
+	llmRes, answered, refDocIDs, err := d.llm.Answer(ctx, svc.GenerateReq{
+		Question:      answerRes.Question,
+		Groups:        answerRes.Groups,
+		Prompt:        answerRes.Content,
+		DefaultAnswer: bot.UnknownPrompt,
+		NewCommentID:  0,
+	})
+	if err != nil {
+		logger.WithErr(err).Error("answer failed")
+
+		if mq.MessageMetadata(ctx).NumDelivered == mq.MessageMaxDeliver {
+			logger.Info("ai answer error, notify admin")
+			d.batcher.Send(model.StatInfo{
+				Type: model.StatTypeBotUnknown,
+				Ts:   util.HourTrunc(disc.CreatedAt.Time()).Unix(),
+				Key:  data.DiscUUID,
+			})
+			d.pub.Publish(ctx, topic.TopicMessageNotify, topic.MsgMessageNotify{
+				DiscussHeader: disc.Header(),
+				Type:          model.MsgNotifyTypeBotUnknown,
+				FromID:        disc.UserID,
+				ToID:          bot.UserID,
+			})
+		}
+
+		return err
+	}
+	if !answered {
+		metadata := mq.MessageMetadata(ctx)
+		// first delivery, retry later
+		if metadata.NumDelivered == 1 {
+			return errors.New("ai not know the answer, retry later")
+		}
+	}
+
+	nowUnix := time.Now().Unix()
+	for _, refDocID := range refDocIDs {
+		d.batcher.Send(model.StatInfo{
+			Type:        model.StatTypeKnowledgeHit,
+			Ts:          nowUnix,
+			Key:         refDocID,
+			AssociateID: data.DiscID,
+		})
+	}
+
+	if answered || bot.UnknownPrompt != "" {
+		commentID, err := d.disc.CreateComment(ctx, bot.UserID, data.DiscUUID, svc.CommentCreateReq{
+			Content:     llmRes,
+			CommentID:   0,
+			Bot:         true,
+			BotAnswered: answered,
+		})
+		if err != nil {
+			logger.WithErr(err).Error("create comment failed")
+			return err
+		}
+
+		if answered {
+			err = d.disc.SetBotUnknown(ctx, data.DiscID, false)
+			if err != nil {
+				logger.WithErr(err).Warn("set bot known failed")
+			}
+		}
+
+		logger.With("comment_id", commentID).With("content", llmRes).Info("comment created")
+	}
+
+	if !answered {
+		logger.Info("ai not know the answer, notify admin")
+		d.batcher.Send(model.StatInfo{
+			Type: model.StatTypeBotUnknown,
+			Ts:   util.HourTrunc(disc.CreatedAt.Time()).Unix(),
+			Key:  data.DiscUUID,
+		})
+		d.pub.Publish(ctx, topic.TopicMessageNotify, topic.MsgMessageNotify{
+			DiscussHeader: disc.Header(),
+			Type:          model.MsgNotifyTypeBotUnknown,
+			FromID:        disc.UserID,
+			ToID:          bot.UserID,
+		})
+	}
+	return nil
+}
+
+func (d *Disc) handleUpdate(ctx context.Context, data topic.MsgDiscChange) error {
+	logger := d.logger.WithContext(ctx).With("data", data)
+	logger.Debug("handle update discussion doc")
+
+	bot, err := d.bot.Get(ctx)
+	if err != nil {
+		logger.WithErr(err).Error("get bot failed")
+		return nil
+	}
+
+	postRes, err := d.llm.GeneratePrompt(ctx, svc.GeneratePromptOpts{Mode: svc.PromptModeAnswerNoComments, DiscIDs: []uint{data.DiscID}})
+	if err != nil {
+		logger.WithErr(err).Error("generate prompt failed")
+		return nil
+	}
+	llmRes, answered, refDocIDs, err := d.llm.Answer(ctx, svc.GenerateReq{
+		Question:      postRes.Question,
+		Prompt:        postRes.Content,
+		DefaultAnswer: bot.UnknownPrompt,
+		NewCommentID:  0,
+		Groups:        postRes.Groups,
+	})
+	if err != nil {
+		logger.WithErr(err).Error("answer failed")
+		return err
+	}
+	if !answered {
+		metadata := mq.MessageMetadata(ctx)
+		// first delivery, retry later
+		if metadata.NumDelivered == 1 {
+			return errors.New("ai not know the answer, retry later")
+		}
+	}
+
+	disc, err := d.disc.GetByID(ctx, data.DiscID)
+	if err != nil {
+		if errors.Is(err, database.ErrRecordNotFound) {
+			logger.Info("disc not found, return")
+			return nil
+		}
+
+		logger.WithErr(err).Error("get disc failed")
+		return err
+	}
+
+	if !answered && bot.UnknownPrompt == "" {
+		logger.Info("ai can not answer, skip")
+		if !disc.BotUnknown {
+			err = d.disc.SetBotUnknown(ctx, disc.ID, true)
+			if err != nil {
+				logger.WithErr(err).Warn("set disc bot known failed")
+			}
+		}
+
+		return nil
+	}
+
+	nowUnix := time.Now().Unix()
+	for _, refDocID := range refDocIDs {
+		d.batcher.Send(model.StatInfo{
+			Type:        model.StatTypeKnowledgeHit,
+			Ts:          nowUnix,
+			Key:         refDocID,
+			AssociateID: data.DiscID,
+		})
+	}
+
+	haveBotComment := true
+	botComment, err := d.disc.GetBotComment(ctx, data.DiscID)
+	if err != nil {
+		if !errors.Is(err, database.ErrRecordNotFound) {
+			logger.WithErr(err).Warn("query bot comment failed")
+			return nil
+		}
+
+		haveBotComment = false
+	}
+
+	if haveBotComment {
+		err = d.disc.UpdateComment(ctx, model.UserInfo{
+			UserCore: model.UserCore{
+				UID: botComment.UserID,
+			},
+			UserBasic: model.UserBasic{
+				Role: model.UserRoleUser,
+			},
+		}, data.DiscUUID, botComment.ID, svc.CommentUpdateReq{
+			Content: llmRes,
+			Bot:     true,
+		})
+		if err != nil {
+			logger.WithErr(err).Warn("update bot comment failed")
+		}
+	} else if disc.BotUnknown {
+		_, err = d.disc.CreateComment(ctx, bot.UserID, data.DiscUUID, svc.CommentCreateReq{
+			Content:     llmRes,
+			Bot:         true,
+			BotAnswered: answered,
+		})
+		if err != nil {
+			logger.WithErr(err).Warn("create bot comment failed")
+		}
+	}
+
+	if disc.BotUnknown == answered {
+		err = d.disc.SetBotUnknown(ctx, disc.ID, !disc.BotUnknown)
+		if err != nil {
+			logger.WithErr(err).Warn("set bot unknown failed")
+		}
+	}
+
+	return nil
+}
+
+func (d *Disc) handleDelete(ctx context.Context, data topic.MsgDiscChange) error {
+	d.logger.WithContext(ctx).With("disc_id", data.DiscID).Debug("handle delete discussion doc")
+	return nil
+}

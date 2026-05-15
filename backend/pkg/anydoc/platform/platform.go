@@ -1,0 +1,23 @@
+package platform
+
+type PlatformType uint
+
+const (
+	PlatformUnknown PlatformType = iota
+	PlatformConfluence
+	PlatformFeishu
+	PlatformFile
+	PlatformNotion
+	PlatformSitemap
+	PlatformURL
+	PlatformWikiJS
+	PlatformYuQue
+	PlatformPandawiki
+	PlatformDingtalk
+)
+
+type Platform interface {
+	Platform() PlatformType
+	ListMethod() string
+	PathPrefix() string
+}

@@ -1,0 +1,51 @@
+package model
+
+type RankType uint
+
+const (
+	RankTypeContribute RankType = iota + 1
+	RankTypeAIInsight
+	RankTypeAllContribute
+	RankTypeHotQuestion
+	RankTypeInvalidKnowledge
+)
+
+type Rank struct {
+	Base
+	Type        RankType `gorm:"column:type;index:idx_rank_type_score" json:"type"`
+	ScoreID     string   `gorm:"column:score_id;type:text;index" json:"score_id"`
+	Score       float64  `gorm:"column:score;index:idx_rank_type_score" json:"score"`
+	RagID       string   `gorm:"column:rag_id;type:text;index" json:"rag_id"`
+	ForeignID   uint     `gorm:"column:foreign_id;type:bigint;default:0" json:"foreign_id"`
+	AssociateID uint     `gorm:"column:associate_id;type:bigint;default:0" json:"associate_id"`
+	Extra       string   `gorm:"column:extra;type:text" json:"extra"`
+	Hit         int64    `gorm:"column:hit;type:bigint;default:1" json:"hit"`
+}
+
+type RankTimeGroupItem struct {
+	ID          uint    `json:"id"`
+	SocreID     string  `json:"score_id"`
+	ForeignID   uint    `json:"foreign_id"`
+	AssociateID uint    `json:"associate_id"`
+	Extra       string  `json:"extra"`
+	Score       float64 `json:"score"`
+}
+
+type RankTimeGroup struct {
+	Time  Timestamp                  `json:"time"`
+	Items JSONB[[]RankTimeGroupItem] `json:"items" gorm:"type:jsonb"`
+}
+
+type RankMetadata struct {
+	Type RankType
+}
+
+func (r RankMetadata) Map() map[string]any {
+	return map[string]any{
+		"type": r.Type,
+	}
+}
+
+func init() {
+	registerAutoMigrate(&Rank{})
+}

@@ -1,0 +1,161 @@
+package repo
+
+import (
+	"context"
+	"sync"
+	"time"
+
+	"github.com/chaitin/koalaqa/model"
+	"github.com/chaitin/koalaqa/pkg/database"
+	"github.com/chaitin/koalaqa/pkg/rag"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+)
+
+type Forum struct {
+	base[*model.Forum]
+	lock sync.Mutex
+	rag  rag.Service
+}
+
+func newForum(db *database.DB, rag rag.Service, disc *Discussion) *Forum {
+	return &Forum{base: base[*model.Forum]{db: db, m: &model.Forum{}}, lock: sync.Mutex{}, rag: rag}
+}
+
+func init() {
+	register(newForum)
+}
+
+func (f *Forum) GetFirstID(ctx context.Context) (uint, error) {
+	var id uint
+	if err := f.model(ctx).Order("id ASC").Pluck("id", &id).Error; err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func (f *Forum) UpdateWithGroup(ctx context.Context, forums []model.ForumInfo) error {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+
+	return f.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var ids model.Int64Array
+		for _, forum := range forums {
+			if forum.ID > 0 {
+				ids = append(ids, int64(forum.ID))
+			}
+		}
+
+		var exists []model.Forum
+		if err := tx.Where("id = ANY(?)", ids).Find(&exists).Error; err != nil {
+			return err
+		}
+
+		existsMap := make(map[uint]model.Forum)
+		for _, forum := range exists {
+			existsMap[forum.ID] = forum
+		}
+
+		delIds := make([]uint, 0)
+		if err := tx.Model(f.m).Scopes(func(d *gorm.DB) *gorm.DB {
+			if len(ids) == 0 {
+				return d.Where("true")
+			}
+			return d.Where("id != ALL(?)", ids)
+		}).Pluck("id", &delIds).Error; err != nil {
+			return err
+		}
+
+		if len(delIds) > 0 {
+			var discussions []model.Discussion
+			if err := tx.Model(&model.Discussion{}).Where("forum_id IN (?)", delIds).Find(&discussions).Error; err != nil {
+				return err
+			}
+			if err := tx.Model(&model.Discussion{}).Where("forum_id IN (?)", delIds).Delete(nil).Error; err != nil {
+				return err
+			}
+			for _, delId := range delIds {
+				var forum model.Forum
+				if err := tx.Where("id = ?", delId).First(&forum).Error; err != nil {
+					return err
+				}
+				if err := f.rag.DeleteDataset(ctx, forum.DatasetID); err != nil {
+					return err
+				}
+				if err := f.rag.DeleteDataset(ctx, forum.InsightDatasetID); err != nil {
+					return err
+				}
+				if err := tx.Model(&model.Org{}).Where("? =ANY(forum_ids)", delId).Updates(map[string]any{
+					"forum_ids":  gorm.Expr("ARRAY_REMOVE(forum_ids, ?)", delId),
+					"updated_at": time.Now(),
+				}).Error; err != nil {
+					return err
+				}
+			}
+			if err := tx.Model(f.m).Where("id IN (?)", delIds).Delete(nil).Error; err != nil {
+				return err
+			}
+		}
+
+		var data []model.Forum
+		for _, forum := range forums {
+			datasetID := existsMap[forum.ID].DatasetID
+			if datasetID == "" {
+				id, err := f.rag.CreateDataset(ctx)
+				if err != nil {
+					return err
+				}
+				datasetID = id
+			}
+			insightDatasetID := existsMap[forum.ID].InsightDatasetID
+			if insightDatasetID == "" {
+				var err error
+				insightDatasetID, err = f.rag.CreateDataset(ctx)
+				if err != nil {
+					return err
+				}
+			}
+
+			if len(forum.BlogIDs) > 3 {
+				forum.BlogIDs = forum.BlogIDs[:3]
+			}
+
+			data = append(data, model.Forum{
+				Base: model.Base{
+					ID: forum.ID,
+				},
+				Name:             forum.Name,
+				RouteName:        forum.RouteName,
+				Index:            forum.Index,
+				Groups:           forum.Groups,
+				BlogIDs:          forum.BlogIDs,
+				DatasetID:        datasetID,
+				InsightDatasetID: insightDatasetID,
+				TagEnabled:       forum.TagEnabled,
+				TagIDs:           forum.TagIDs,
+				Links:            forum.Links,
+			})
+		}
+
+		err := tx.Clauses(clause.OnConflict{
+			Columns:   []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{"name", "route_name", "index", "groups", "blog_ids", "dataset_id", "tag_ids", "tag_enabled", "links"}),
+		}).CreateInBatches(&data, 1000).Error
+		if err != nil {
+			return err
+		}
+
+		forumIDs := make(model.Int64Array, len(data))
+		for i, forum := range data {
+			forumIDs[i] = int64(forum.ID)
+		}
+
+		err = tx.Model(&model.Org{}).Where("builtin = ? AND type = ?", true, model.OrgTypeAdmin).
+			UpdateColumn("forum_ids", forumIDs).Error
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+}

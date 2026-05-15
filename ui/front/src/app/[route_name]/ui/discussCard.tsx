@@ -1,0 +1,232 @@
+'use client'
+
+import { ModelDiscussionListItem, ModelDiscussionType } from '@/api/types'
+import { StatusChip, DiscussionTypeChip, MarkDown } from '@/components'
+import CommonAvatar from '@/components/CommonAvatar'
+import { CommonContext } from '@/components/commonProvider'
+import { TimeDisplay } from '@/components/TimeDisplay'
+import { Ellipsis, Icon } from '@ctzhian/ui'
+import { Box, Chip, Stack, SxProps } from '@mui/material'
+import Link from 'next/link'
+import { useParams } from 'next/navigation'
+import { memo, useContext, useMemo } from 'react'
+
+const isCategoryTag = (tag: string, groups: Array<{ name?: string }>) => {
+  return groups.some((group) => group.name === tag)
+}
+
+const DiscussCard = ({
+  data,
+  keywords: _keywords,
+  onNavigate,
+  sx,
+  size = 'medium',
+  filter,
+}: {
+  data: ModelDiscussionListItem
+  keywords?: string
+  showType?: boolean
+  sx?: SxProps
+  size?: 'small' | 'medium'
+  onNavigate: () => void
+  filter?: 'hot' | 'new' | 'publish'
+}) => {
+  const it = data
+  const { groups } = useContext(CommonContext)
+  const params = useParams()
+  const profileHref = it.user_id ? `/profile/${it.user_id}` : undefined
+
+  // 使用 useMemo 优化分组名称计算，避免重复查找
+  const groupNames = useMemo(() => {
+    if (!it.group_ids || !groups.flat.length) return []
+
+    // 创建group映射表，避免重复查找
+    const groupMap = new Map(groups.flat.map((g) => [g.id, g.name]))
+
+    return it.group_ids.map((groupId) => groupMap.get(groupId)).filter(Boolean) as string[]
+  }, [it.group_ids, groups.flat])
+
+  // 确保 route_name 在服务器端和客户端一致，避免 hydration 错误
+  const routeName = (params?.route_name as string) || ''
+
+  const isQAPost = it.type === ModelDiscussionType.DiscussionTypeQA
+  const isArticlePost = it.type === ModelDiscussionType.DiscussionTypeBlog
+  const isIssuePost = it.type === ModelDiscussionType.DiscussionTypeIssue
+  return (
+    <Box
+      sx={{
+        borderBottom: '1px solid #f3f4f6',
+        transition: 'all 0.2s',
+        cursor: 'pointer',
+        '&:hover': {
+          bgcolor: (theme) => theme.palette.primaryAlpha?.[3] || 'rgba(0,99,151,0.03)',
+        },
+        pt: 1.8,
+        pb: 2.5,
+        px: 1,
+        ...sx,
+      }}
+    >
+      <Stack direction='row' alignItems='center' sx={{ ...(size === 'small' ? { lineHeight: '22px' } : {}), mb: 2 }}>
+        <Link
+          href={profileHref || '/'}
+          key={it.id}
+          style={{ textDecoration: 'none', color: 'inherit' }}
+          onClick={onNavigate}
+        >
+          <Box
+            tabIndex={0}
+            sx={{
+              outline: 'none',
+              display: 'flex',
+              alignItems: 'center',
+              borderRadius: 1,
+              transition: 'box-shadow 0.2s, border-color 0.2s, background 0.2s',
+              color: 'text.primary',
+              '&:focus-within, &:hover ': {
+                color: 'primary.main',
+              },
+            }}
+          >
+            <Box
+              sx={{
+                display: 'inline-flex',
+                cursor: profileHref ? 'pointer' : 'default',
+              }}
+              tabIndex={-1}
+            >
+              <CommonAvatar
+                src={it.user_avatar}
+                name={it.user_name}
+                sx={{
+                  fontSize: '0.65rem',
+                  fontWeight: 600,
+                  ...(size === 'small' && {
+                    width: 22,
+                    height: 22,
+                  }),
+                }}
+              />
+            </Box>
+            <Box
+              sx={{
+                fontSize: size === 'small' ? '14px' : '14px',
+                lineHeight: size === 'small' ? '22px' : 'normal',
+                textDecoration: 'none',
+                outline: 'none',
+                color: 'inherit',
+                fontWeight: 600,
+                cursor: 'pointer',
+                ml: 1,
+              }}
+              tabIndex={-1}
+            >
+              {it.user_name || ''}
+            </Box>
+          </Box>
+        </Link>
+        <Box sx={{ mx: 0.5 }}>·</Box>
+        <Box sx={{ fontWeight: 400, whiteSpace: 'nowrap', fontSize: '14px' }}>
+          <TimeDisplay
+            style={{ color: 'rgba(33, 34, 45, 0.30)' }}
+            timestamp={filter === 'publish' ? it.created_at || it.updated_at! : it.updated_at!}
+          />
+        </Box>
+      </Stack>
+      <Link href={`/${routeName}/${it.uuid}`} key={it.id} onClick={onNavigate}>
+        <Ellipsis
+          sx={{
+            mb: 2,
+            fontWeight: 700,
+            color: '#111827',
+            letterSpacing: '-0.01em',
+            fontSize: size === 'small' ? '16px' : '18px',
+            lineHeight: size === 'small' ? '24px' : 'normal',
+            '&:hover': { color: '#000000' },
+            flex: 1,
+          }}
+        >
+          {it.title}
+        </Ellipsis>
+        <MarkDown
+          content={it.type === ModelDiscussionType.DiscussionTypeBlog ? it.summary : it.content}
+          truncateLength={100}
+          sx={{
+            mb: 2,
+            lineHeight: 1.5,
+            fontSize: '0.8125rem',
+            color: 'rgba(33, 34, 45, 0.50) !important',
+            bgcolor: 'transparent !important',
+            '&.markdown-body': {
+              backgroundColor: 'transparent !important',
+              color: 'rgba(33, 34, 45, 0.50) !important',
+            },
+            '& *': {
+              fontSize: '0.8125rem !important',
+              color: 'rgba(33, 34, 45, 0.50) !important',
+            },
+          }}
+        />
+
+        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <Box sx={{ display: 'flex', gap: 1.5, flexWrap: 'wrap' }}>
+            <StatusChip item={it} size={size} />
+            <DiscussionTypeChip size={size} type={it.type} variant='default' />
+            {/* 使用通用状态标签组件 */}
+            {groupNames.map((tag, index) => {
+              const isCategory = isCategoryTag(tag, groups.flat)
+              return (
+                <Chip
+                  key={`${tag}-${isCategory ? 'category' : 'tag'}-${index}`}
+                  label={tag}
+                  size='small'
+                  sx={{
+                    bgcolor: 'rgba(233, 236, 239, 1)',
+                    color: '#21222D',
+                    height: size === 'small' ? 20 : 22,
+                    fontSize: size === 'small' ? '12px' : '12px',
+                    lineHeight: '22px',
+                    borderRadius: '3px',
+                    cursor: 'default',
+                    pointerEvents: 'none',
+                  }}
+                />
+              )
+            })}
+          </Box>
+
+          <Box
+            sx={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 0.5,
+              background: '#E9ECEF',
+              color: '#21222D',
+              px: 1,
+              lineHeight: '22px',
+              height: '22px',
+              fontSize: '12px',
+              fontWeight: 'bold',
+              borderRadius: 0.5,
+            }}
+          >
+            {isQAPost ? (
+              <>
+                <Icon type='icon-wendapinglun' sx={{ fontSize: 12 }} />
+                <Box>{it.comment || 0}</Box>
+              </>
+            ) : (
+              <>
+                <Icon type='icon-dianzan1' sx={{ fontSize: '12px' }} />
+                <Box>{it.like || 0}</Box>
+              </>
+            )}
+          </Box>
+        </Box>
+      </Link>
+    </Box>
+  )
+}
+
+// 使用 React.memo 优化组件，避免不必要的重新渲染
+export default memo(DiscussCard)

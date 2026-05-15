@@ -1,0 +1,2949 @@
+'use client'
+
+import { getDiscussionAskAskSessionId, getDiscussionAskSession, getRankHotQuestion, postDiscussionAskStop } from '@/api'
+import { getCsrfToken } from '@/api/httpClient'
+
+import { ModelDiscussionListItem, ModelSuggestQuestionType, ModelUserInfo, SvcBotGetRes } from '@/api/types'
+import { getSystemWebPlugin } from '@/api/WebPlugin'
+import { AuthContext } from '@/components/authProvider'
+import UserAvatar from '@/components/UserAvatar'
+import Alert from '@/components/alert'
+import BrandAttribution from '@/components/BrandAttribution'
+import { useForumStore } from '@/store'
+import SSEClient from '@/utils/fetch'
+import ContentCopyIcon from '@mui/icons-material/ContentCopy'
+import copy from 'copy-to-clipboard'
+import SendIcon from '@mui/icons-material/Send'
+import StopIcon from '@mui/icons-material/Stop'
+import WarningAmberIcon from '@mui/icons-material/WarningAmber'
+import MarkDown from 'react-markdown'
+import rehypeRaw from 'rehype-raw'
+import rehypeSanitize, { defaultSchema, type Options as RehypeSanitizeOptions } from 'rehype-sanitize'
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
+import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
+import remarkGfm from 'remark-gfm'
+import remarkBreaks from 'remark-breaks'
+import {
+  alpha,
+  Avatar,
+  Box,
+  Button,
+  CircularProgress,
+  Collapse,
+  Fade,
+  Grid,
+  IconButton,
+  Paper,
+  Stack,
+  TextField,
+  Tooltip,
+  Typography,
+  useTheme,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogContentText,
+  DialogActions,
+} from '@mui/material'
+import AutoAwesomeIcon from '@mui/icons-material/AutoAwesome'
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
+import ExpandLessIcon from '@mui/icons-material/ExpandLess'
+import { useRouter, useSearchParams } from 'next/navigation'
+import { UIEvent, useCallback, useContext, useEffect, useRef, useState } from 'react'
+import { Ellipsis, Icon } from '@ctzhian/ui'
+import IframeHeader from './IframeHeader'
+
+// 检查回答是否是"无法回答问题"
+const cannotAnswerPatterns = [/^无法回答问题$/, /^无法回答$/]
+const SEARCH_LOADING_TEXT = '正在为您搜索相关帖子...'
+const AUTO_SCROLL_THRESHOLD_PX = 120
+type WaitingStatus = 'thinking' | 'searching' | 'answering'
+
+const markdownSanitizeSchema: RehypeSanitizeOptions = {
+  ...defaultSchema,
+  tagNames: [...(defaultSchema.tagNames || []), 'video', 'source'],
+  attributes: {
+    ...defaultSchema.attributes,
+    video: [
+      ...(defaultSchema.attributes?.video || []),
+      'src',
+      'controls',
+      'autoplay',
+      'muted',
+      'loop',
+      'playsinline',
+      'poster',
+      'preload',
+      'width',
+      'height',
+    ],
+    source: [...(defaultSchema.attributes?.source || []), 'src', 'type', 'media'],
+  },
+  protocols: {
+    ...defaultSchema.protocols,
+    src: [...(defaultSchema.protocols?.src || []), 'http', 'https'],
+    poster: [...(defaultSchema.protocols?.poster || []), 'http', 'https'],
+  },
+}
+
+const WAITING_STATUS_TEXT: Record<WaitingStatus, string> = {
+  thinking: '正在思考...',
+  searching: '正在搜索文档...',
+  answering: '正在回答...',
+}
+interface Message {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  type?: 'ai' | 'search' | 'need_human' // ai: AI知识库回答, search: 搜索帖子回答, need_human: 转人工
+  sources?: ModelDiscussionListItem[] // 引用帖子
+  discCount?: number // 搜索结果数量
+  summary?: string // 智能总结
+  needsForumSelection?: boolean // 是否需要选择板块
+  pendingQuestion?: string // 待处理的问题
+  originalQuestionForSearch?: string // 用于重新搜索的原始问题
+  showPostPrompt?: boolean // 是否显示发帖提示
+  originalQuestion?: string // 原始问题，用于填充发帖表单
+  forumId?: number // 板块ID，用于发帖
+  timestamp?: string // 时间戳
+  isComplete?: boolean // 是否已完成（流式输出完成）
+  isInterrupted?: boolean // 是否被手动中断
+}
+
+interface CustomerServiceContentProps {
+  readonly initialUser?: ModelUserInfo
+  readonly botData?: SvcBotGetRes & { avatar?: string } | null
+  readonly sessionId: string
+  readonly onClose?: () => void
+  readonly isWidgetMode?: boolean
+  readonly permissionCheckType?: 'enabled' | 'display'
+}
+
+export default function CustomerServiceContent({
+  initialUser,
+  botData,
+  sessionId,
+  onClose,
+  isWidgetMode,
+  permissionCheckType,
+}: CustomerServiceContentProps) {
+  const { user } = useContext(AuthContext)
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const theme = useTheme()
+  const displayUser = user?.uid ? user : initialUser
+  const userInitial = displayUser?.username?.[0]?.toUpperCase() || 'U'
+  const forumId = useForumStore((s) => s.selectedForumId)
+  const forums = useForumStore((s) => s.forums)
+  const [botName, setBotName] = useState(botData?.name || '小智助手')
+  const [botAvatar, setBotAvatar] = useState<string>(botData?.avatar || '')
+  const [messages, setMessages] = useState<Message[]>([])
+  const [inputValue, setInputValue] = useState('')
+  const [isLoading, setIsLoading] = useState(false)
+  const [waitingStatus, setWaitingStatus] = useState<WaitingStatus | null>(null)
+  const [isAutoScrollEnabled, setIsAutoScrollEnabled] = useState(true)
+  const [sessionExpiredDialogOpen, setSessionExpiredDialogOpen] = useState(false)
+  const [previewImage, setPreviewImage] = useState<{ src: string; alt: string } | null>(null)
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null)
+  const [isInputFocused, setIsInputFocused] = useState(false)
+  const [isServiceEnabled, setIsServiceEnabled] = useState<boolean | null>(null) // null表示正在加载
+  const [isInitialLoading, setIsInitialLoading] = useState(true) // 初始数据是否加载完成
+  const [expandedSources, setExpandedSources] = useState<Set<string>>(new Set()) // 展开的搜索结果消息ID
+  const [clientSessionId, setClientSessionId] = useState<string>('') // 客户端获取的 sessionId，用于 widget 模式
+  const [supportSuggestQuestions, setSupportSuggestQuestions] = useState<string[]>([])
+  const [showSupportSuggestions, setShowSupportSuggestions] = useState(true)
+  const [showWelcomeCard, setShowWelcomeCard] = useState(true)
+  const getSuggestListByMode = useCallback(
+    (data?: { suggest_questions?: string[]; plugin_suggest_questions?: string[] }) => {
+      if (!data) return [] as string[]
+      return (isWidgetMode ? data.plugin_suggest_questions : data.suggest_questions) || []
+    },
+    [isWidgetMode],
+  )
+  // 区分真正的 iframe 嵌入和 Widget 模式
+  // Widget 模式不需要显示 IframeHeader，因为外层组件已经有自己的容器
+  const [isInIframe, setIsInIframe] = useState(() => {
+    // widget 模式优先视为 iframe 容器内渲染
+    if (isWidgetMode) return true
+    return searchParams?.get('is_widget') === '1'
+  })
+  // 从 URL 读取 source 参数，如果没有则根据 isInIframe 状态决定默认值
+  const [sourceParam, setSourceParam] = useState<number>(() => {
+    const urlSource = searchParams?.get('source')
+    if (urlSource !== null && urlSource !== undefined) {
+      const parsed = Number.parseInt(urlSource, 10)
+      if (!Number.isNaN(parsed)) {
+        return parsed
+      }
+    }
+    // 默认值：iframe 模式为 1，否则为 0
+    return isInIframe ? 1 : 0
+  })
+  const isStreaming = isLoading || waitingStatus !== null
+  const waitingStatusText = waitingStatus ? WAITING_STATUS_TEXT[waitingStatus] : ''
+
+  // 检测是否在 iframe 中
+  useEffect(() => {
+    // widget 模式强制视为 iframe 环境
+    if (isWidgetMode) {
+      setIsInIframe(true)
+      return
+    }
+
+    const inIframe = window.self !== window.top || searchParams?.get('is_widget') === '1'
+    if (inIframe) {
+      setIsInIframe(true)
+      document.body.style.background = 'unset'
+      document.body.style.margin = '0'
+      document.body.style.padding = '0'
+      document.body.style.overflow = 'hidden'
+
+      // 强力禁止窗口滚动
+      const preventScroll = () => {
+        if (window.scrollY !== 0 || window.scrollX !== 0) {
+          window.scrollTo(0, 0)
+        }
+      }
+      window.addEventListener('scroll', preventScroll)
+      return () => {
+        window.removeEventListener('scroll', preventScroll)
+        document.body.style.background = ''
+        document.body.style.margin = ''
+        document.body.style.padding = ''
+        document.body.style.overflow = ''
+      }
+    }
+  }, [searchParams, isWidgetMode])
+
+  // Hide the widget button on this page
+  useEffect(() => {
+    const style = document.createElement('style')
+    style.innerHTML = `
+      .cs-widget-button {
+        display: none !important;
+      }
+      .cs-widget-modal {
+        display: none !important;
+      }
+    `
+    document.head.appendChild(style)
+
+    return () => {
+      document.head.removeChild(style)
+    }
+  }, [])
+
+  // 格式化时间
+  const formatTime = (timestamp: string) => {
+    const date = new Date(timestamp)
+    const now = new Date()
+    const diffMs = now.getTime() - date.getTime()
+    const diffMins = Math.floor(diffMs / 60000)
+
+    if (diffMins < 1) return '刚刚'
+    if (diffMins < 60) return `${diffMins}分钟前`
+    if (diffMins < 1440) return `${Math.floor(diffMins / 60)}小时前`
+
+    return date.toLocaleString('zh-CN', {
+      month: 'numeric',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+  }
+
+  // 复制消息内容
+  const handleCopyMessage = useCallback(async (content: string, messageId: string) => {
+    try {
+      await copy(content)
+      setCopiedMessageId(messageId)
+      setTimeout(() => setCopiedMessageId(null), 2000)
+    } catch (err) {
+      console.error('复制失败:', err)
+    }
+  }, [])
+
+  // 记录初始 URL 中是否有 id（用于区分是否需要加载历史对话）
+  const initialUrlIdRef = useRef<string | null>(searchParams.get('id'))
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const scrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sseClientRef = useRef<SSEClient<any> | null>(null)
+  const currentMessageRef = useRef<Message | null>(null)
+  const hasStreamedRef = useRef(false)
+
+  // 获取当前的 sessionId，优先级：clientSessionId > URL id > props sessionId
+  const getCurrentSessionId = useCallback(() => {
+    // 优先使用客户端获取的 sessionId（widget 模式下）
+    if (clientSessionId) {
+      return clientSessionId
+    }
+    // 其次从 searchParams 获取（Next.js 的 useSearchParams 是响应式的）
+    const urlId = searchParams.get('id')
+    if (urlId) {
+      return urlId
+    }
+    // 最后使用 props 中的 sessionId
+    return sessionId
+  }, [clientSessionId, searchParams, sessionId])
+
+  // 在 widget 模式下，如果 URL 中没有 id 参数且 props 中的 sessionId 为空，
+  // 则在客户端获取 sessionId 并存储到 state，避免 URL 更新导致的页面重新渲染
+  useEffect(() => {
+    const urlId = searchParams.get('id')
+    const isWidget = searchParams.get('is_widget') === '1'
+
+    // 只在 widget 模式下，且没有 URL id，且没有 props sessionId，且还没有获取过 clientSessionId 时执行
+    if (isWidget && !urlId && !sessionId && !clientSessionId) {
+      const fetchSessionId = async () => {
+        try {
+          const newSessionId = await getDiscussionAskSession({})
+          if (newSessionId) {
+            // 存储到 state，不更新 URL，避免页面重新渲染
+            setClientSessionId(newSessionId)
+          }
+        } catch (error) {
+          console.error('获取会话ID失败:', error)
+        }
+      }
+
+      fetchSessionId()
+    }
+  }, [searchParams, sessionId, clientSessionId])
+
+  // 如果 URL 中没有 id 参数，添加 sessionId 到 URL
+  useEffect(() => {
+    const urlId = searchParams.get('id')
+    if (urlId !== sessionId && sessionId) {
+      const currentUrl = new URL(window.location.href)
+      currentUrl.searchParams.set('id', sessionId)
+      router.replace(currentUrl.pathname + currentUrl.search, { scroll: false })
+    }
+  }, [sessionId, searchParams, router])
+
+  // 移除登录检查，允许未登录用户访问
+
+  // 用于标记是否已经加载过历史对话，避免重复加载
+  const historyLoadedRef = useRef<string | null>(null)
+  // 用于标记正在加载的历史对话 SessionID，避免重复请求
+  const loadingHistorySessionIdRef = useRef<string | null>(null)
+
+  // 当 sessionId 或 clientSessionId 变化时，加载历史对话
+  useEffect(() => {
+    const currentSessionId = getCurrentSessionId()
+    if (!currentSessionId) {
+      return
+    }
+    // 如果用户未登录，currentUserId 可能为 0 或 undefined，仍然允许加载历史对话
+
+    // 如果已经加载过这个 sessionId 的历史对话，不再重复加载
+    if (historyLoadedRef.current === currentSessionId) {
+      return
+    }
+
+    // 如果正在加载这个 sessionId 的历史对话，不再重复加载
+    if (loadingHistorySessionIdRef.current === currentSessionId) {
+      return
+    }
+
+    // 如果 URL 中没有 id 参数，说明是新访问的页面（从 header 点击进入），应该加载历史对话
+    // 如果 URL 中有 id 参数，且与 sessionId 相同，说明是直接访问某个会话，也应该加载历史对话
+    const urlId = searchParams.get('id')
+    const shouldLoadHistory = !urlId || urlId === currentSessionId
+
+    if (!shouldLoadHistory) {
+      return
+    }
+
+    // 标记正在加载
+    loadingHistorySessionIdRef.current = currentSessionId
+
+    const loadHistory = async () => {
+      try {
+        const response = await getDiscussionAskAskSessionId({ askSessionId: currentSessionId })
+
+        const historyItems = response.items || []
+
+        if (historyItems && historyItems.length > 0) {
+          // 过滤掉匹配 cannotAnswerPatterns 的机器人消息（但保留最后一条）
+          const filteredItems = historyItems.filter((item, index) => {
+            // 如果是最后一条，无论是否匹配都保留
+            const isLastItem = index === historyItems.length - 1
+            if (isLastItem) {
+              return true
+            }
+
+            // 如果是机器人消息，检查内容是否匹配\"无法回答问题\"的模式
+            if (item.bot && item.content) {
+              const content = item.content.trim()
+              const isCannotAnswer = cannotAnswerPatterns.some((pattern) => pattern.test(content))
+              // 过滤掉匹配的消息（但最后一条已经在上面的判断中保留了）
+              return !isCannotAnswer
+            }
+            // 用户消息和空内容的消息都保留
+            return true
+          })
+
+          // 转换历史记录为 Message 格式
+          let lastUserQuestion: string | null = null
+
+          const historyMessages: Message[] = filteredItems.map((item, index) => {
+            const message: Message = {
+              id: item.id?.toString() || `history-${index}`,
+              role: item.bot ? 'assistant' : 'user',
+              content: item.content || '',
+              type: item.bot ? 'ai' : undefined,
+              timestamp: item.created_at
+                ? typeof item.created_at === 'number'
+                  ? new Date(item.created_at * 1000).toISOString()
+                  : item.created_at
+                : new Date().toISOString(),
+            }
+
+            // 如果有 summary_discs，渲染成搜索结果
+            if (item.bot && item.summary_discs && item.summary_discs.length > 0) {
+              message.type = 'search'
+              message.sources = item.summary_discs
+              message.discCount = item.summary_discs.length
+              if (!message.forumId) {
+                message.forumId = item.summary_discs[0]?.forum_id
+              }
+            }
+
+            // 检查是否是 need_human 消息（根据后端返回的标识或内容特征）
+            if (item.bot && item.need_human) {
+              message.type = 'need_human'
+              message.showPostPrompt = true
+            }
+
+            if (item.bot) {
+              message.isComplete = true
+              if (lastUserQuestion) {
+                message.originalQuestion = lastUserQuestion
+                message.originalQuestionForSearch = lastUserQuestion
+              }
+              if (!message.forumId && item.summary_discs && item.summary_discs.length > 0) {
+                message.forumId = item.summary_discs[0]?.forum_id
+              }
+            } else if (message.content) {
+              lastUserQuestion = message.content
+            }
+
+            return message
+          })
+
+          setMessages(historyMessages)
+        } else {
+          // 没有历史记录，清空消息
+          setMessages([])
+        }
+
+        // 标记已加载
+        historyLoadedRef.current = currentSessionId
+        setIsInitialLoading(false)
+      } catch (error) {
+        console.error('加载历史对话失败:', error)
+        // 加载失败，清空消息
+        setMessages([])
+        // 即使加载失败，也标记为已尝试加载，避免重复请求
+        historyLoadedRef.current = currentSessionId
+        setIsInitialLoading(false)
+      } finally {
+        loadingHistorySessionIdRef.current = null
+      }
+    }
+
+    loadHistory()
+  }, [sessionId, clientSessionId, searchParams, getCurrentSessionId])
+
+  // 检查智能客服是否开启
+  useEffect(() => {
+    const checkServiceEnabled = async () => {
+      try {
+        const response = await getSystemWebPlugin({ skipAuthRedirect: true })
+
+        // Backend logic: service is enabled if any of Enabled, Display, or Plugin is true
+        // This matches: if !webPlugin.Enabled && !webPlugin.Display && !webPlugin.Plugin { return error }
+        const isEnabled = response?.enabled === true || response?.display === true || response?.plugin === true
+        setIsServiceEnabled(isEnabled)
+
+        const questionType = isWidgetMode ? response?.plugin_question_type : response?.question_type
+
+        if (questionType === ModelSuggestQuestionType.SuggestQuestionTypeHot) {
+          try {
+            const hotRes = await getRankHotQuestion({ skipAuthRedirect: true } as any)
+            const hotList = (hotRes?.items || []).map((item) => item.content || '').filter(Boolean)
+            setSupportSuggestQuestions(hotList)
+            setShowSupportSuggestions(hotList.length > 0)
+          } catch {
+            setSupportSuggestQuestions([])
+            setShowSupportSuggestions(false)
+          }
+        } else if (questionType === ModelSuggestQuestionType.SuggestQuestionTypeCustomize) {
+          const customList = getSuggestListByMode(response)
+          setSupportSuggestQuestions(customList)
+          setShowSupportSuggestions(customList.length > 0)
+        } else {
+          setSupportSuggestQuestions([])
+          setShowSupportSuggestions(false)
+        }
+      } catch (error) {
+        console.error('获取智能客服配置失败:', error)
+        // 默认允许访问，避免因网络问题阻止用户
+        setIsServiceEnabled(true)
+      }
+    }
+    checkServiceEnabled()
+  }, [isWidgetMode, getSuggestListByMode])
+
+  // 从 props 更新机器人信息（如果服务端获取到了）
+  useEffect(() => {
+    if (botData?.name) {
+      setBotName(botData.name)
+    }
+    if (botData?.avatar) {
+      setBotAvatar(botData.avatar)
+    }
+  }, [botData])
+
+  // 清理资源
+  useEffect(() => {
+    return () => {
+      if (sseClientRef.current) {
+        sseClientRef.current.unsubscribe()
+        sseClientRef.current = null
+      }
+    }
+  }, [])
+
+  // 滚动到底部
+  useEffect(() => {
+    // 强制窗口回到顶部，防止发生意料之外的垂直偏移
+    if (isInIframe && typeof window !== 'undefined') {
+      window.scrollTo(0, 0)
+      // 在渲染完成后再次检查，确保万无一失
+      requestAnimationFrame(() => {
+        window.scrollTo(0, 0)
+      })
+    }
+
+    if (!isAutoScrollEnabled || messages.length === 0) {
+      return
+    }
+
+    if (scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTo({
+        top: scrollContainerRef.current.scrollHeight,
+        behavior: 'smooth',
+      })
+    }
+  }, [messages, isLoading, isAutoScrollEnabled, isInIframe])
+
+  useEffect(() => {
+    if (isStreaming) {
+      hasStreamedRef.current = true
+      return
+    }
+
+    if (hasStreamedRef.current) {
+      setIsAutoScrollEnabled((prev) => (prev ? false : prev))
+    }
+  }, [isStreaming])
+
+  useEffect(() => {
+    if (!showSupportSuggestions) return
+    const hasUserMessage = messages.some((m) => m.role === 'user')
+    if (hasUserMessage) {
+      setShowSupportSuggestions(false)
+    }
+  }, [messages, showSupportSuggestions])
+
+  // 新会话或欢迎卡片可见时，重新展示推荐问题
+  useEffect(() => {
+    if (showWelcomeCard && supportSuggestQuestions.length > 0) {
+      setShowSupportSuggestions(true)
+    }
+  }, [showWelcomeCard, supportSuggestQuestions])
+
+  useEffect(() => {
+    const hasUserMessage = messages.some((m) => m.role === 'user')
+    if (hasUserMessage && showWelcomeCard) {
+      setShowWelcomeCard(false)
+    }
+  }, [messages, showWelcomeCard])
+
+  const handleScroll = useCallback(
+    (event: UIEvent<HTMLDivElement>) => {
+      const element = event.currentTarget
+
+      if (scrollTimeoutRef.current) {
+        clearTimeout(scrollTimeoutRef.current)
+      }
+
+      setIsAutoScrollEnabled((prev) => (prev ? false : prev))
+
+      scrollTimeoutRef.current = setTimeout(() => {
+        const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight
+
+        if (isStreaming) {
+          const shouldEnable = distanceFromBottom <= AUTO_SCROLL_THRESHOLD_PX
+          setIsAutoScrollEnabled((prev) => (prev === shouldEnable ? prev : shouldEnable))
+        } else {
+          setIsAutoScrollEnabled((prev) => (prev ? false : prev))
+        }
+      }, 150)
+    },
+    [isStreaming],
+  )
+
+  useEffect(() => {
+    return () => {
+      if (scrollTimeoutRef.current) {
+        clearTimeout(scrollTimeoutRef.current)
+      }
+    }
+  }, [])
+
+  // 调用智能总结接口的公共函数
+  const callSummaryContent = useCallback(
+    async (forumId: number, question: string, messageId: string, originalQuestion?: string) => {
+      try {
+        // 准备headers：如果不在widget/iframe中且用户已登录，添加CSRF token
+        const headers: Record<string, string> = {}
+
+        const csrfToken = await getCsrfToken()
+        if (csrfToken) {
+          headers['X-CSRF-TOKEN'] = csrfToken
+        }
+
+        const summarySseClient = new SSEClient<any>({
+          url: '/api/discussion/summary/content',
+          method: 'POST',
+          headers,  // 传入准备好的headers
+          streamMode: true,
+          onError: (err: Error) => {
+            console.error('智能总结生成失败:', err)
+            const errorMessage = err.message || err.toString()
+
+            // 检查是否是 session closed 错误
+            if (errorMessage.toLowerCase().includes('session closed')) {
+              setSessionExpiredDialogOpen(true)
+              setIsLoading(false)
+              setIsAutoScrollEnabled(false)
+              setMessages((prev) => {
+                const newMessages = [...prev]
+                const index = newMessages.findIndex((m) => m.id === messageId)
+                if (index !== -1) {
+                  newMessages[index] = {
+                    ...newMessages[index],
+                    content: '会话已过期，请点击右上角开启新会话。',
+                  }
+                }
+                return newMessages
+              })
+              return
+            }
+
+            setIsLoading(false)
+            setIsAutoScrollEnabled(false)
+            setMessages((prev) => {
+              const newMessages = [...prev]
+              const index = newMessages.findIndex((m) => m.id === messageId)
+              if (index !== -1) {
+                newMessages[index] = {
+                  ...newMessages[index],
+                  content: '抱歉，搜索失败，请稍后重试。',
+                }
+              }
+              return newMessages
+            })
+          },
+          onComplete: () => {
+            setIsLoading(false)
+            // 标记消息已完成
+            setMessages((prev) => {
+              const newMessages = [...prev]
+              const index = newMessages.findIndex((m) => m.id === messageId)
+              if (index !== -1) {
+                newMessages[index] = {
+                  ...newMessages[index],
+                  isComplete: true,
+                }
+              }
+              return newMessages
+            })
+            setIsAutoScrollEnabled(false)
+          },
+        })
+
+        sseClientRef.current = summarySseClient
+        setIsAutoScrollEnabled(true)
+
+        let summaryText = ''
+        let searchResults: ModelDiscussionListItem[] = []
+        let discCount: number | undefined // 提升到外层作用域
+
+        // 获取当前的 sessionId，确保与 URL 同步
+        const currentSessionId = getCurrentSessionId()
+
+        const summaryRequestBody = JSON.stringify({
+          content: question,
+          forum_id: forumId,
+          session_id: currentSessionId,
+          source: sourceParam,
+        })
+
+        const thinkingPatterns = [/思考[:：]/, /推理[:：]/, /分析[:：]/, /让我想想/, /我需要/, /正在思考/]
+
+        summarySseClient.subscribe(summaryRequestBody, (data) => {
+          // 检测 session closed 错误
+          let dataStr = ''
+          if (typeof data === 'string') {
+            dataStr = data
+          } else if (data && typeof data === 'object') {
+            dataStr = JSON.stringify(data)
+          }
+
+          if (dataStr.toLowerCase().includes('session closed')) {
+            setSessionExpiredDialogOpen(true)
+            setIsLoading(false)
+            setMessages((prev) => {
+              const newMessages = [...prev]
+              const index = newMessages.findIndex((m) => m.id === messageId)
+              if (index !== -1) {
+                newMessages[index] = {
+                  ...newMessages[index],
+                  content: '会话已过期，请点击右上角开启新会话。',
+                }
+              }
+              return newMessages
+            })
+            return
+          }
+
+          // 检测后端发送的 cancel 事件（用户手动停止生成）
+          if (data && typeof data === 'object' && (data as any).cancel === true) {
+            setIsLoading(false)
+            setMessages((prev) => {
+              const newMessages = [...prev]
+              const index = newMessages.findIndex((m) => m.id === messageId)
+              if (index !== -1) {
+                newMessages[index] = {
+                  ...newMessages[index],
+                  isComplete: true,
+                  isInterrupted: true, // 标记为被中断
+                }
+              }
+              return newMessages
+            })
+            summarySseClient.unsubscribe()
+            return
+          }
+
+          // 处理新的流式数据格式
+          if (data && typeof data === 'object') {
+            const dataObj = data as any
+            const eventType = dataObj.event
+            const eventData = dataObj.data
+
+            // 处理 event:disc_count
+            if (eventType === 'disc_count') {
+              const count = typeof eventData === 'number' ? eventData : Number.parseInt(String(eventData), 10)
+              if (!Number.isNaN(count)) {
+                discCount = count
+                // 立即更新消息，显示搜索结果数量（此时 sources 可能还是空的）
+                setMessages((prev) => {
+                  const newMessages = [...prev]
+                  const index = newMessages.findIndex((m) => m.id === messageId)
+                  if (index !== -1) {
+                    newMessages[index] = {
+                      ...newMessages[index],
+                      type: 'search',
+                      discCount: count,
+                      sources: searchResults, // 保持现有的 sources
+                      content: '', // 此时还没有总结文本
+                      forumId: forumId,
+                    }
+                  }
+                  return newMessages
+                })
+
+                // 如果 disc_count === 0，显示没有找到结果
+                if (count === 0) {
+                  setMessages((prev) => {
+                    const newMessages = [...prev]
+                    const index = newMessages.findIndex((m) => m.id === messageId)
+                    if (index !== -1) {
+                      newMessages[index] = {
+                        ...newMessages[index],
+                        content: '抱歉，暂时没有找到相关帖子。',
+                        showPostPrompt: !!originalQuestion,
+                        originalQuestion: originalQuestion,
+                        forumId: forumId,
+                      }
+                    }
+                    return newMessages
+                  })
+                  setIsLoading(false)
+                }
+              }
+              return
+            }
+
+            // 处理 event:disc - 单个帖子信息
+            if (eventType === 'disc') {
+              let discItem: ModelDiscussionListItem | null = null
+
+              if (typeof eventData === 'string') {
+                try {
+                  discItem = JSON.parse(eventData) as ModelDiscussionListItem
+                } catch {
+                  // 解析失败，忽略
+                }
+              } else if (eventData && typeof eventData === 'object') {
+                discItem = eventData as ModelDiscussionListItem
+              }
+
+              if (discItem) {
+                // 添加到搜索结果列表
+                searchResults.push(discItem)
+
+                // 更新消息，显示最新的搜索结果列表
+                setMessages((prev) => {
+                  const newMessages = [...prev]
+                  const index = newMessages.findIndex((m) => m.id === messageId)
+                  if (index !== -1) {
+                    newMessages[index] = {
+                      ...newMessages[index],
+                      type: 'search',
+                      sources: [...searchResults], // 使用新数组触发更新
+                      discCount: discCount ?? searchResults.length,
+                      forumId: forumId,
+                      // 保持现有的 content（如果有的话）
+                    }
+                  }
+                  return newMessages
+                })
+              }
+              return
+            }
+
+            // 处理 event:text - 总结文本
+            if (eventType === 'text') {
+              let textToAdd = ''
+
+              if (typeof eventData === 'string') {
+                try {
+                  // 处理 JSON 字符串化的内容（后端使用 fmt.Sprintf("%q", content)）
+                  const unquoted = eventData.replaceAll(/^"|"$/g, '')
+                  textToAdd = unquoted.replaceAll(/\\"/g, '"').replaceAll(/\\n/g, '\n')
+                } catch {
+                  textToAdd = eventData
+                }
+              } else if (eventData && typeof eventData === 'object') {
+                textToAdd =
+                  eventData.content ||
+                  eventData.text ||
+                  eventData.chunk ||
+                  eventData.message ||
+                  eventData.result ||
+                  eventData.summary ||
+                  ''
+              }
+
+              if (textToAdd) {
+                // 过滤思考过程
+                const isThinkingLine = thinkingPatterns.some((pattern) => pattern.test(textToAdd))
+                if (!isThinkingLine) {
+                  summaryText += textToAdd
+                  // 更新消息，显示总结文本
+                  setMessages((prev) => {
+                    const newMessages = [...prev]
+                    const index = newMessages.findIndex((m) => m.id === messageId)
+                    if (index !== -1) {
+                      newMessages[index] = {
+                        ...newMessages[index],
+                        content: summaryText,
+                        type: 'search',
+                        summary: summaryText,
+                        sources: searchResults,
+                        discCount: discCount ?? searchResults.length,
+                      }
+                    }
+                    return newMessages
+                  })
+                }
+              }
+              return
+            }
+
+            // 处理 summary_failed（如果后端还返回这个字段）
+            if (dataObj.summary_failed === true) {
+              setMessages((prev) => {
+                const newMessages = [...prev]
+                const index = newMessages.findIndex((m) => m.id === messageId)
+                if (index !== -1) {
+                  newMessages[index] = {
+                    ...newMessages[index],
+                    content: '抱歉，总结生成失败，请稍后重试。',
+                    type: 'search',
+                    sources: searchResults,
+                    discCount: discCount ?? searchResults.length,
+                  }
+                }
+                return newMessages
+              })
+              setIsLoading(false)
+              return
+            }
+          }
+        })
+      } catch (err) {
+        console.error('调用智能总结失败:', err)
+        const errorMessage = err instanceof Error ? err.message : String(err)
+
+        // 检查是否是 session closed 错误
+        if (errorMessage.toLowerCase().includes('session closed')) {
+          setSessionExpiredDialogOpen(true)
+          setIsLoading(false)
+          setIsAutoScrollEnabled(false)
+          setMessages((prev) => {
+            const newMessages = [...prev]
+            const index = newMessages.findIndex((m) => m.id === messageId)
+            if (index !== -1) {
+              newMessages[index] = {
+                ...newMessages[index],
+                content: '会话已过期，请点击右上角开启新会话。',
+              }
+            }
+            return newMessages
+          })
+          return
+        }
+
+        setIsLoading(false)
+        setIsAutoScrollEnabled(false)
+        setMessages((prev) => {
+          const newMessages = [...prev]
+          const index = newMessages.findIndex((m) => m.id === messageId)
+          if (index !== -1) {
+            newMessages[index] = {
+              ...newMessages[index],
+              content: '抱歉，搜索失败，请稍后重试。',
+            }
+          }
+          return newMessages
+        })
+      }
+    },
+    [sessionId, getCurrentSessionId],
+  )
+
+  // 核心发送逻辑
+  const sendMessage = useCallback(async (content: string) => {
+    const question = content.trim()
+    if (!question || isLoading) return
+
+    setShowSupportSuggestions(false)
+    setShowWelcomeCard(false)
+
+    const userMessage: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: question,
+      timestamp: new Date().toISOString(),
+    }
+
+    setMessages((prev) => [...prev, userMessage])
+
+    setIsLoading(true)
+    setWaitingStatus('answering')
+    setIsAutoScrollEnabled(true)
+
+    // 发送后立即确保窗口不偏移
+    if (isInIframe) {
+      window.scrollTo(0, 0)
+    }
+
+    // 创建助手消息占位符
+    const assistantMessage: Message = {
+      id: (Date.now() + 1).toString(),
+      role: 'assistant',
+      content: '',
+      type: 'ai',
+      timestamp: new Date().toISOString(),
+      originalQuestionForSearch: question,
+    }
+    // 保存消息 ID 到闭包中，确保后续使用正确的 ID
+    const assistantMessageId = assistantMessage.id
+    setMessages((prev) => [...prev, assistantMessage])
+    currentMessageRef.current = assistantMessage
+
+    try {
+      // 使用 postDiscussionAsk 进行流式输出
+
+
+      // 获取当前的 sessionId，确保与 URL 同步
+      const currentSessionId = getCurrentSessionId()
+
+      // 构建请求体
+      const requestBody = JSON.stringify({
+        question: question,
+        session_id: currentSessionId,
+        source: sourceParam,
+      })
+
+      let answerText = ''
+      const thinkingPatterns = [/思考[:：]/, /推理[:：]/, /分析[:：]/, /让我想想/, /我需要/, /正在思考/]
+
+      // 准备headers：如果不在widget/iframe中且用户已登录，添加CSRF token
+      const headers: Record<string, string> = {}
+
+      const csrfToken = await getCsrfToken()
+      if (csrfToken) {
+        headers['X-CSRF-TOKEN'] = csrfToken
+      }
+
+      // 使用 Promise 来等待流式输出完成
+      let hasReceivedData = false
+
+      const streamComplete = new Promise<void>((resolve, reject) => {
+        // 创建 SSE 客户端，在回调中处理完成逻辑
+        const askSseClient = new SSEClient<any>({
+          url: '/api/discussion/ask',
+          method: 'POST',
+          headers,  // 传入准备好的headers
+          streamMode: true,
+          onError: (err: Error) => {
+            console.error('AI 回答生成失败:', err)
+            const errorMessage = err.message || err.toString()
+
+            // 检查是否是 ratelimit 错误
+            if (errorMessage === 'ratelimit' || errorMessage.includes('ratelimit')) {
+              Alert.warning('请求过于频繁，请稍后再试', 3000)
+              setIsLoading(false)
+              setWaitingStatus(null)
+              setIsAutoScrollEnabled(false)
+              setMessages((prev) => {
+                const newMessages = [...prev]
+                const index = newMessages.findIndex((m) => m.id === assistantMessageId)
+                if (index !== -1) {
+                  newMessages[index] = {
+                    ...newMessages[index],
+                    content: '请求过于频繁，请稍后再试。',
+                    isComplete: true,
+                  }
+                }
+                return newMessages
+              })
+              resolve()
+              return
+            }
+
+            // 检查是否是 session closed 错误
+            if (errorMessage.toLowerCase().includes('session closed')) {
+              setSessionExpiredDialogOpen(true)
+              setIsLoading(false)
+              setWaitingStatus(null)
+              setIsAutoScrollEnabled(false)
+              setMessages((prev) => {
+                const newMessages = [...prev]
+                const index = newMessages.findIndex((m) => m.id === assistantMessageId)
+                if (index !== -1) {
+                  newMessages[index] = {
+                    ...newMessages[index],
+                    content: '会话已过期，请点击右上角开启新会话。',
+                  }
+                }
+                return newMessages
+              })
+              resolve() // 使用 resolve 而不是 reject，避免触发 catch
+              return
+            }
+
+            setIsLoading(false)
+            setWaitingStatus(null)
+            setIsAutoScrollEnabled(false)
+            reject(err)
+          },
+          onComplete: () => {
+            setWaitingStatus(null)
+
+            const finalAnswer = answerText.trim()
+            const cannotAnswer = cannotAnswerPatterns.some((pattern) => pattern.test(finalAnswer))
+
+            // 标记消息完成状态（无法回答时保持未完成，等待搜索流程结束）
+            setMessages((prev) => {
+              const newMessages = [...prev]
+              const index = newMessages.findIndex((m) => m.id === assistantMessageId)
+              if (index !== -1) {
+                newMessages[index] = {
+                  ...newMessages[index],
+                  isComplete: !cannotAnswer,
+                }
+              }
+              return newMessages
+            })
+            setIsAutoScrollEnabled(false)
+
+            if (cannotAnswer) {
+              // 检查是否有多个板块
+              const hasMultipleForums = forums && forums.length > 1
+
+              if (hasMultipleForums) {
+                // 提示选择板块 - 使用消息 ID 而不是索引
+                setMessages((prev) => {
+                  const newMessages = [...prev]
+                  const index = newMessages.findIndex((m) => m.id === assistantMessageId)
+                  if (index !== -1) {
+                    newMessages[index] = {
+                      ...newMessages[index],
+                      content: '抱歉，我暂时无法回答这个问题。请选择一个板块，我将为您搜索相关帖子。',
+                      type: 'search',
+                      needsForumSelection: true,
+                      pendingQuestion: question,
+                      isComplete: false,
+                    }
+                  }
+                  return newMessages
+                })
+                setIsLoading(false)
+                resolve()
+              } else {
+                // 只有一个板块，直接调用智能总结
+                // 使用闭包中保存的 assistantMessageId，而不是从 ref 获取
+                // 如果没有 forumId，使用第一个（唯一的）板块
+                const targetForumId = forumId ?? forums?.[0]?.id
+
+                if (assistantMessageId && targetForumId !== undefined && targetForumId !== null) {
+                  // 更新消息为loading状态，不展示"无法回答" - 使用消息 ID 而不是索引
+                  setMessages((prev) => {
+                    const newMessages = [...prev]
+                    const index = newMessages.findIndex((m) => m.id === assistantMessageId)
+                    if (index !== -1) {
+                      newMessages[index] = {
+                        ...newMessages[index],
+                        content: SEARCH_LOADING_TEXT,
+                        type: 'search',
+                        isComplete: false,
+                      }
+                    }
+                    return newMessages
+                  })
+
+                  // 保持loading状态
+                  setIsLoading(true)
+                    ; (async () => {
+                      await callSummaryContent(targetForumId, question, assistantMessageId, question)
+                      resolve()
+                    })()
+                } else {
+                  setIsLoading(false)
+                  resolve()
+                }
+              }
+            } else {
+              setIsLoading(false)
+              resolve()
+            }
+          },
+        })
+
+        sseClientRef.current = askSseClient
+
+        askSseClient.subscribe(requestBody, (data) => {
+          // 处理 need_human 事件
+          if (data && typeof data === 'object' && (data as any).event === 'need_human') {
+            const eventData = (data as any).data
+            let textContent = ''
+            if (typeof eventData === 'string') {
+              textContent = eventData
+            } else if (eventData && typeof eventData === 'object') {
+              textContent = eventData.content || eventData.text || eventData.message || ''
+            }
+
+            // 更新消息为 need_human 类型
+            setMessages((prev) => {
+              const newMessages = [...prev]
+              const index = newMessages.findIndex((m) => m.id === assistantMessageId)
+              if (index !== -1) {
+                newMessages[index] = {
+                  ...newMessages[index],
+                  type: 'need_human',
+                  content: textContent,
+                  isComplete: true,
+                  showPostPrompt: true,
+                  originalQuestion: question,
+                  forumId: forumId || undefined,
+                }
+              }
+              return newMessages
+            })
+            setIsLoading(false)
+            setWaitingStatus(null)
+            askSseClient.unsubscribe()
+            resolve()
+            return
+          }
+
+          const eventType = typeof data === 'object' && data ? (data as any).event : null
+          if (eventType === 'thinking') {
+            setWaitingStatus('thinking')
+            return
+          }
+          if (eventType === 'searching') {
+            setWaitingStatus('searching')
+            return
+          }
+
+          // Check for ratelimit in JSON data (200 OK case)
+          if (data && typeof data === 'object' && (data as any).err === 'ratelimit') {
+            Alert.warning('请求过于频繁，请稍后再试', 3000)
+            setIsLoading(false)
+            setWaitingStatus(null)
+            setIsAutoScrollEnabled(false)
+            setMessages((prev) => {
+              const newMessages = [...prev]
+              const index = newMessages.findIndex((m) => m.id === assistantMessageId)
+              if (index !== -1) {
+                newMessages[index] = {
+                  ...newMessages[index],
+                  content: '请求过于频繁，请稍后再试。',
+                  isComplete: true,
+                }
+              }
+              return newMessages
+            })
+            askSseClient.unsubscribe()
+            resolve()
+            return
+          }
+
+          // 检测 session closed 错误
+          let dataStr = ''
+          if (typeof data === 'string') {
+            dataStr = data
+          } else if (data && typeof data === 'object') {
+            dataStr = JSON.stringify(data)
+          }
+
+          if (dataStr.toLowerCase().includes('session closed')) {
+            setSessionExpiredDialogOpen(true)
+            setIsLoading(false)
+            setWaitingStatus(null)
+            setIsAutoScrollEnabled(false)
+            setMessages((prev) => {
+              const newMessages = [...prev]
+              const index = newMessages.findIndex((m) => m.id === assistantMessageId)
+              if (index !== -1) {
+                newMessages[index] = {
+                  ...newMessages[index],
+                  content: '会话已过期，请点击右上角开启新会话。',
+                }
+              }
+              return newMessages
+            })
+            // 停止处理后续数据
+            askSseClient.unsubscribe()
+            resolve()
+            return
+          }
+
+          // 检测后端发送的 cancel 事件（用户手动停止生成）
+          if (data && typeof data === 'object' && (data as any).cancel === true) {
+            setIsLoading(false)
+            setWaitingStatus(null)
+            setMessages((prev) => {
+              const newMessages = [...prev]
+              const index = newMessages.findIndex((m) => m.id === assistantMessageId)
+              if (index !== -1) {
+                newMessages[index] = {
+                  ...newMessages[index],
+                  isComplete: true,
+                  isInterrupted: true, // 标记为被中断
+                }
+              }
+              return newMessages
+            })
+            currentMessageRef.current = null
+            askSseClient.unsubscribe()
+            resolve()
+            return
+          }
+
+          let textToAdd = ''
+          if (typeof data === 'string') {
+            // 处理 JSON 字符串化的内容（后端使用 fmt.Sprintf("%q", content)）
+            try {
+              // 移除引号
+              const unquoted = data.replaceAll(/^"|"$/g, '')
+              textToAdd = unquoted.replaceAll(/\\"/g, '"').replaceAll(/\\n/g, '\n')
+            } catch {
+              textToAdd = data
+            }
+          } else if (data && typeof data === 'object') {
+            // 如果是带 event 字段的对象，从 data.data 中提取内容
+            if ((data as any).event === 'text') {
+              // event:text 类型，提取 data 字段
+              const eventData = (data as any).data
+              if (typeof eventData === 'string') {
+                textToAdd = eventData
+              } else if (eventData && typeof eventData === 'object') {
+                textToAdd =
+                  eventData.content || eventData.text || eventData.chunk || eventData.message || eventData.result || ''
+              }
+            } else if (!(data as any).event) {
+              // 没有 event 字段的普通对象
+              textToAdd = data.content || data.text || data.data || data.chunk || data.message || data.result || ''
+            }
+            // 其他 event 类型（如 end）已在 fetch.ts 中处理，这里不处理
+          }
+
+          if (textToAdd) {
+            // 检查是否是思考过程
+            const isThinkingLine = thinkingPatterns.some((pattern) => pattern.test(textToAdd))
+
+            // 只添加非思考过程的内容
+            if (!isThinkingLine) {
+              if (!hasReceivedData) {
+                hasReceivedData = true
+                setWaitingStatus(null)
+              }
+              answerText += textToAdd
+
+              // 使用消息 ID 而不是索引，确保即使消息数组发生变化也能正确更新
+              setMessages((prev) => {
+                const newMessages = [...prev]
+                const index = newMessages.findIndex((m) => m.id === assistantMessageId)
+                if (index !== -1) {
+                  newMessages[index] = {
+                    ...newMessages[index],
+                    content: answerText,
+                    type: 'ai',
+                  }
+                }
+                return newMessages
+              })
+            }
+          }
+        })
+      })
+
+      // 等待流式输出完成
+      try {
+        await streamComplete
+      } catch (err) {
+        console.error('流式输出错误:', err)
+        const errorMessage = err instanceof Error ? err.message : String(err)
+
+        // 检查是否是 session closed 错误
+        if (errorMessage.toLowerCase().includes('session closed')) {
+          setSessionExpiredDialogOpen(true)
+          setMessages((prev) => {
+            const newMessages = [...prev]
+            const index = newMessages.findIndex((m) => m.id === assistantMessageId)
+            if (index !== -1) {
+              newMessages[index] = {
+                ...newMessages[index],
+                content: '会话已过期，请点击右上角开启新会话。',
+              }
+            }
+            return newMessages
+          })
+        }
+        setIsAutoScrollEnabled(false)
+        return
+      }
+    } catch (error) {
+      console.error('发送消息失败:', error)
+      setMessages((prev) => {
+        const newMessages = [...prev]
+        const lastIndex = newMessages.length - 1
+        if (newMessages[lastIndex]?.role === 'assistant') {
+          newMessages[lastIndex] = {
+            ...newMessages[lastIndex],
+            content: '抱歉，服务暂时不可用，请稍后重试。',
+            type: 'ai',
+          }
+        }
+        return newMessages
+      })
+      setIsLoading(false)
+      setWaitingStatus(null)
+      setIsAutoScrollEnabled(false)
+      setIsAutoScrollEnabled(false)
+      currentMessageRef.current = null
+    }
+  }, [isLoading, forumId, forums, router, getCurrentSessionId, callSummaryContent])
+
+  const handleSend = useCallback(async () => {
+    if (!inputValue.trim() || isLoading) return
+    const text = inputValue
+    setInputValue('')
+    await sendMessage(text)
+  }, [inputValue, isLoading, sendMessage])
+
+  const handleSuggestClick = useCallback(
+    (question: string) => {
+      if (isLoading) return
+      const text = question.trim()
+      if (!text) return
+      setInputValue('')
+      setShowSupportSuggestions(false)
+      setShowWelcomeCard(false)
+      void sendMessage(text)
+    },
+    [isLoading, sendMessage],
+  )
+
+  // 处理 URL 中的 question 参数
+  const hasAutoAskedRef = useRef(false)
+
+  useEffect(() => {
+    const rawQuestion = searchParams.get('question')
+    const question = rawQuestion ? decodeURIComponent(rawQuestion) : null
+
+    if (question && !hasAutoAskedRef.current && sessionId && !isLoading && !isInitialLoading) {
+      hasAutoAskedRef.current = true
+
+      // 先移除 URL 参数
+      const currentUrl = new URL(window.location.href)
+      currentUrl.searchParams.delete('question')
+      router.replace(currentUrl.pathname + currentUrl.search, { scroll: false })
+
+      // 再发送消息
+      sendMessage(question)
+    }
+  }, [searchParams, sessionId, sendMessage, isInitialLoading, isLoading, router]) // isLoading not included to avoid loop, checked in condition
+
+  // 处理回车发送
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey && !(e.nativeEvent as KeyboardEvent).isComposing) {
+      e.preventDefault()
+      handleSend()
+    }
+  }
+
+  // 中断对话 - 只调用后端 API，等待后端发送 cancel 事件
+  const handleStop = useCallback(async () => {
+    const currentSessionId = getCurrentSessionId()
+    if (currentSessionId) {
+      try {
+        await postDiscussionAskStop({
+          session_id: currentSessionId,
+        })
+      } catch (error) {
+        console.error('停止对话失败:', error)
+      }
+    }
+
+    // 3. 更新状态
+    setIsLoading(false)
+    setWaitingStatus(null)
+    setIsAutoScrollEnabled(false)
+
+    // 4. 标记当前消息为已完成（被中断），保留已输出的内容
+    if (currentMessageRef.current) {
+      const messageId = currentMessageRef.current.id
+      setMessages((prev) => {
+        const newMessages = [...prev]
+        const index = newMessages.findIndex((m) => m.id === messageId)
+        if (index !== -1) {
+          newMessages[index] = {
+            ...newMessages[index],
+            isComplete: true,
+            isInterrupted: true, // 标记为被中断
+          }
+        }
+        return newMessages
+      })
+      currentMessageRef.current = null
+    }
+  }, [getCurrentSessionId, forumId])
+
+  // 点击引用帖
+  const handleSourceClick = (discussion: ModelDiscussionListItem) => {
+    // ModelDiscussionListItem 可能没有 route_name，需要通过 forum_id 查找
+    const forum = forums.find((f) => f.id === discussion.forum_id)
+    const routePath = forum?.route_name ? `/${forum.route_name}/${discussion.uuid}` : `/${discussion.uuid}`
+    window.open(routePath, '_blank')
+  }
+
+  // 处理跳转到发帖页面
+  const handleGoToPost = (question: string, messageForumId?: number, messageId?: string) => {
+    // 检查是否有多个板块且未指定板块
+    const hasMultipleForums = forums.length > 1
+
+    // 如果有多个板块且未指定板块，显示板块选择器
+    if (hasMultipleForums && !messageForumId) {
+      // 更新消息，添加 needsForumSelection 标记
+      setMessages((prev) => {
+        const newMessages = [...prev]
+        const index = newMessages.findIndex((m) => m.id === messageId)
+        if (index !== -1) {
+          newMessages[index] = {
+            ...newMessages[index],
+            needsForumSelection: true,
+            pendingQuestion: question,
+          }
+        }
+        return newMessages
+      })
+      return
+    }
+
+    // 优先使用消息中保存的 forumId，否则使用全局 forumId
+    const targetForumId = messageForumId ?? forumId ?? forums[0]?.id
+    const forum = forums.find((f) => f.id === targetForumId)
+
+    if (!forum?.route_name) {
+      console.error('未找到板块信息:', { targetForumId, forums })
+      return
+    }
+    // 检查登录状态
+    const currentUser = user?.uid ? user : initialUser
+    if (!currentUser?.uid) {
+      // 未登录，跳转到登录页，带上重定向参数和内容
+      const targetForumId = messageForumId ?? forumId ?? forums[0]?.id
+      const forum = forums.find((f) => f.id === targetForumId)
+
+      if (!forum?.route_name) {
+        console.error('未找到板块信息:', { targetForumId, forums })
+        return
+      }
+
+      // 构建发帖页面 URL，传递标题和类型参数
+      const encodedTitle = encodeURIComponent(question)
+      const postUrl = `/${forum.route_name}/edit?type=qa&title=${encodedTitle}`
+      const loginUrl = `/login?redirect=${encodeURIComponent(postUrl)}`
+      router.push(loginUrl)
+      return
+    }
+    // 已登录，直接跳转到发帖页面
+    // 构建发帖页面 URL，传递标题和类型参数
+    const encodedTitle = encodeURIComponent(question)
+    const postUrl = `/${forum.route_name}/edit?type=qa&title=${encodedTitle}`
+    window.open(postUrl, '_blank')
+  }
+
+  const handleSearchRelatedPosts = useCallback(
+    async (question: string, messageForumId?: number) => {
+      const trimmedQuestion = question.trim()
+      if (!trimmedQuestion) return
+
+      const availableForums = forums || []
+      const hasMultipleForums = availableForums.length > 1
+      const inferredForumId = messageForumId ?? forumId ?? availableForums[0]?.id
+
+      if (hasMultipleForums && (messageForumId === undefined || messageForumId === null) && !forumId) {
+        const selectionMessageId = `select-${Date.now()}`
+        const selectionMessage: Message = {
+          id: selectionMessageId,
+          role: 'assistant',
+          content: '请选择一个板块，我将为您搜索相关帖子。',
+          type: 'search',
+          timestamp: new Date().toISOString(),
+          needsForumSelection: true,
+          pendingQuestion: trimmedQuestion,
+          originalQuestionForSearch: trimmedQuestion,
+          originalQuestion: trimmedQuestion,
+          showPostPrompt: false,
+          isComplete: false,
+        }
+        setMessages((prev) => [...prev, selectionMessage])
+        return
+      }
+
+      if (inferredForumId === undefined || inferredForumId === null) {
+        console.error('未找到用于搜索的板块信息', { messageForumId, forumId, forums })
+        Alert.warning('请先选择板块后再搜索相关帖子', 3000)
+        return
+      }
+
+      const searchMessageId = `search-${Date.now()}`
+      const loadingMessage: Message = {
+        id: searchMessageId,
+        role: 'assistant',
+        content: SEARCH_LOADING_TEXT,
+        type: 'search',
+        timestamp: new Date().toISOString(),
+        summary: undefined,
+        sources: undefined,
+        discCount: undefined,
+        showPostPrompt: false,
+        needsForumSelection: false,
+        pendingQuestion: undefined,
+        isComplete: false,
+        forumId: inferredForumId,
+        originalQuestion: trimmedQuestion,
+        originalQuestionForSearch: trimmedQuestion,
+      }
+
+      setIsLoading(true)
+      setMessages((prev) => [...prev, loadingMessage])
+
+      await callSummaryContent(inferredForumId, trimmedQuestion, searchMessageId, trimmedQuestion)
+    },
+    [forums, forumId, callSummaryContent],
+  )
+
+  // 处理板块选择
+  const handleForumSelect = useCallback(
+    async (selectedForumId: number, question: string, messageId: string) => {
+      setIsLoading(true)
+
+      // 更新消息，移除选择器
+      setMessages((prev) => {
+        const newMessages = [...prev]
+        const index = newMessages.findIndex((m) => m.id === messageId)
+        if (index !== -1) {
+          newMessages[index] = {
+            ...newMessages[index],
+            needsForumSelection: false,
+            content: SEARCH_LOADING_TEXT,
+            type: 'search',
+            summary: undefined,
+            sources: undefined,
+            discCount: undefined,
+            showPostPrompt: false,
+            isComplete: false,
+            forumId: selectedForumId,
+            originalQuestionForSearch: question,
+          }
+        }
+        return newMessages
+      })
+
+      await callSummaryContent(selectedForumId, question, messageId, question)
+    },
+    [callSummaryContent],
+  )
+
+  // 处理发帖的板块选择
+  const handleForumSelectForPost = useCallback(
+    (selectedForumId: number, question: string, messageId: string) => {
+      // 更新消息，移除板块选择标记
+      setMessages((prev) => {
+        const newMessages = [...prev]
+        const index = newMessages.findIndex((m) => m.id === messageId)
+        if (index !== -1) {
+          newMessages[index] = {
+            ...newMessages[index],
+            needsForumSelection: false,
+            forumId: selectedForumId,
+          }
+        }
+        return newMessages
+      })
+
+      // 直接调用 handleGoToPost，传入选中的板块 ID
+      handleGoToPost(question, selectedForumId)
+    },
+    [handleGoToPost],
+  )
+
+  // 处理新会话
+  const handleNewSession = useCallback(async () => {
+    try {
+      // 调用接口创建新会话
+      const newSessionId = await getDiscussionAskSession({ force_create: true })
+
+      if (newSessionId) {
+
+        // 标记为新会话（不应该加载历史对话）
+        initialUrlIdRef.current = null
+
+        // 立即将历史加载标记设置为新 sessionId，防止 URL 变更触发的 effect 重新载入旧会话消息
+        // 重置历史加载标记，使新 session 可以正常加载后端初始化消息（如欢迎语）
+        historyLoadedRef.current = null
+
+        // 如果是 widget 模式通过 clientSessionId 管理会话，同步更新为新 sessionId
+        if (clientSessionId) {
+          setClientSessionId(newSessionId)
+        }
+
+        // 清空消息
+        setMessages([])
+        hasStreamedRef.current = false
+        setIsAutoScrollEnabled(false) // 开启新对话时先不开启自动滚动，避免触发滚动逻辑
+
+        // 更新 URL
+        const currentUrl = new URL(window.location.href)
+        currentUrl.searchParams.set('id', newSessionId)
+        router.replace(currentUrl.pathname + currentUrl.search, { scroll: false })
+
+        // 确保页面回到顶部，防止在 iframe 中出现偏移
+        if (typeof window !== 'undefined') {
+          window.scrollTo(0, 0)
+        }
+
+        // 清空输入框
+        setInputValue('')
+        setShowSupportSuggestions((supportSuggestQuestions.length || 0) > 0)
+        setShowWelcomeCard(true)
+      }
+    } catch (error) {
+      console.error('创建新会话失败:', error)
+    }
+  }, [router, supportSuggestQuestions, clientSessionId])
+
+  return (
+    <Box
+      sx={{
+        display: 'flex',
+        flexDirection: 'column',
+        height: isInIframe ? '100vh' : '100%',
+        background: 'linear-gradient(to bottom, #f7f9fc 0%, #ffffff 100%)',
+        position: 'relative',
+        pt: 0,
+        overflow: 'hidden', // 确保外层不出现滚动条
+      }}
+    >
+      {/* 立即注入 CSS 消除 body 边距，防止闪烁 */}
+      {isInIframe && (
+        <style dangerouslySetInnerHTML={{
+          __html: `
+          html, body { 
+            margin: 0 !important; 
+            padding: 0 !important; 
+            overflow: hidden !important;
+            height: 100% !important;
+            background: #fff !important;
+          }
+        `}} />
+      )}
+
+      {/* iframe 模式下的简化 Header - 始终显示以维持布局稳定 */}
+      {isInIframe && (
+        <IframeHeader
+          title={botName}
+          subtitle="智能客服"
+        />
+      )}
+
+      {isServiceEnabled === null ? (
+        /* 加载状态 */
+        <Box
+          sx={{
+            flex: 1,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+          }}
+        >
+          <CircularProgress />
+        </Box>
+      ) : isServiceEnabled === false ? (
+        /* 服务未开启状态 */
+        <Box
+          sx={{
+            flex: 1,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            px: 3,
+          }}
+        >
+          <Paper
+            elevation={0}
+            sx={{
+              maxWidth: 500,
+              p: 4,
+              textAlign: 'center',
+              borderRadius: 3,
+              border: '1px solid',
+              borderColor: 'divider',
+              background: 'white',
+            }}
+          >
+            <Box
+              sx={{
+                width: 64,
+                height: 64,
+                borderRadius: '50%',
+                bgcolor: alpha(theme.palette.warning.main, 0.1),
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                mx: 'auto',
+                mb: 2,
+              }}
+            >
+              <WarningAmberIcon sx={{ fontSize: 32, color: 'warning.main' }} />
+            </Box>
+            <Typography variant='h6' sx={{ fontWeight: 600, mb: 1.5, color: 'text.primary' }}>
+              智能客服暂未开启
+            </Typography>
+            <Typography variant='body2' sx={{ color: 'text.secondary', lineHeight: 1.6 }}>
+              管理员未开启智能客服功能，请联系管理员后重试
+            </Typography>
+          </Paper>
+        </Box>
+      ) : (
+        /* 正常对话区域 */
+        <>
+          {/* 对话内容区域 - 优化滚动和间距 */}
+          <Box
+            ref={scrollContainerRef}
+            onScroll={handleScroll}
+            sx={{
+              flex: 1,
+              overflow: 'auto',
+              py: 4,
+              px: isInIframe ? 2 : 0,
+              width: '800px',
+              mx: 'auto',
+              maxWidth: '100%',
+              // 隐藏滚动条但保持滚动功能
+              '&::-webkit-scrollbar': {
+                display: 'none',
+                width: 0,
+                height: 0,
+              },
+              // Firefox
+              scrollbarWidth: 'none' as any,
+              // IE and Edge
+              msOverflowStyle: 'none' as any,
+            }}
+          >
+            <Stack spacing={3}>
+              {messages.map((message, index) => {
+                // 判断是否是最后一条机器人消息
+                // 条件：1. 当前是机器人消息 2. 之后没有机器人消息 3. 之前有用户消息
+                const isLastAssistantMessage =
+                  message.role === 'assistant' &&
+                  !messages.slice(index + 1).some((m) => m.role === 'assistant') &&
+                  messages.slice(0, index).some((m) => m.role === 'user')
+
+                // 获取用户最后一条消息作为问题（在当前机器人消息之前）
+                const lastUserMessage = messages.slice(0, index + 1).findLast((m) => m.role === 'user')
+                const questionForPost = lastUserMessage?.content || ''
+                const isSearchSummaryComplete =
+                  message.type === 'search' &&
+                  message.isComplete &&
+                  !!message.content &&
+                  message.content.trim() !== SEARCH_LOADING_TEXT
+                const canShowPostButton =
+                  isSearchSummaryComplete &&
+                  isLastAssistantMessage &&
+                  !!questionForPost &&
+                  !message.showPostPrompt
+                const canShowSearchButton =
+                  message.role === 'assistant' &&
+                  message.type === 'ai' &&
+                  message.isComplete &&
+                  isLastAssistantMessage &&
+                  !!questionForPost &&
+                  !message.showPostPrompt &&
+                  !!message.content
+
+                const isWelcomeMessage = message.role === 'assistant' && index === 0
+
+                if (message.role === 'assistant' && index === 0 && !showWelcomeCard) {
+                  return null
+                }
+
+                return (
+                  <Fade in={true} key={message.id} timeout={400}>
+                    <Box
+                      sx={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: message.role === 'user' ? 'flex-end' : 'flex-start',
+                        gap: 0.5,
+                      }}
+                    >
+                      {message.role === 'assistant' ? (
+                        /* 机器人消息布局：第一行头像+名字，第二行内容 */
+                        <Box
+                          sx={{
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: 1,
+                            width: '100%',
+                          }}
+                        >
+                          {/* 第一行：头像 + 机器人名字 */}
+                          {!isInIframe && !(message.role === 'assistant' && index === 0) && (
+                            <Box
+                              sx={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: 1,
+                              }}
+                            >
+                              <Avatar
+                                src={botAvatar}
+                                sx={{
+                                  background: botAvatar
+                                    ? 'transparent'
+                                    : `linear-gradient(135deg, ${theme.palette.primary.main} 0%, ${theme.palette.primary.dark} 100%)`,
+                                  width: 40,
+                                  height: 40,
+                                  fontWeight: 600,
+                                  boxShadow: 'none',
+                                  flexShrink: 0,
+                                }}
+                              >
+                                {!botAvatar && botName[0]}
+                              </Avatar>
+                              <Typography
+                                variant='body2'
+                                sx={{
+                                  fontWeight: 600,
+                                  color: 'text.primary',
+                                  fontSize: isInIframe ? '14px' : '16px',
+                                }}
+                              >
+                                {botName}
+                              </Typography>
+                            </Box>
+                          )}
+
+                          {/* 第二行：消息内容 */}
+                          <Box
+                            sx={{
+                              display: 'flex',
+                              gap: 1,
+                              alignItems: 'flex-start',
+                              pl: isWelcomeMessage ? 0 : isInIframe ? 0 : 5, // 打招呼卡片与输入区同宽
+                            }}
+                          >
+                            {/* 消息气泡和快速操作按钮容器 */}
+                            <Box
+                              sx={{
+                                display: 'flex',
+                                gap: 1,
+                                alignItems: 'flex-start',
+                                flex: 1,
+                                maxWidth: isWelcomeMessage ? '100%' : isInIframe ? '100%' : 'calc(100% - 40px)',
+                                width: isWelcomeMessage ? '100%' : 'auto',
+                              }}
+                            >
+                              {/* 消息气泡 */}
+                              <Box
+                                sx={{
+                                  position: 'relative',
+                                  maxWidth: '100%',
+                                  width: isWelcomeMessage ? '100%' : 'auto',
+                                  display: 'flex',
+                                  flexDirection: 'column',
+                                  gap: 1,
+                                }}
+                              >
+                                <Paper
+                                  elevation={0}
+                                  sx={{
+                                    px: isWelcomeMessage ? 3 : 2.5,
+                                    py: isWelcomeMessage ? 3 : 1.5,
+                                    width: isWelcomeMessage ? '100%' : 'auto',
+                                    boxShadow: 'none',
+                                    borderRadius: 1,
+                                    border: '1px solid',
+                                    borderColor: 'divider',
+                                    fontSize: '14px',
+                                    overflow: isWelcomeMessage ? 'hidden' : 'overlay',
+                                    position: isWelcomeMessage ? 'relative' : undefined,
+                                    ...(isWelcomeMessage
+                                      ? {
+                                        backgroundImage: `linear-gradient(180deg, ${alpha(theme.palette.primary.main, 0.1)} 0%, rgba(0,156,200,0) 100%)`,
+                                      }
+                                      : { bgcolor: 'white' }),
+                                    '& p': {
+                                      my: 0,
+                                      lineHeight: 1.7,
+                                    },
+                                    '& ul, & ol': {
+                                      my: 1,
+                                      pl: 2,
+                                    },
+                                    '& li': {
+                                      my: 0.5,
+                                    },
+                                    '& code': {
+                                      bgcolor: 'rgba(0, 0, 0, 0.05)',
+                                      px: 0.75,
+                                      py: 0.25,
+                                      borderRadius: 0.5,
+                                      whiteSpace: 'pre-wrap',
+                                      wordBreak: 'break-word',
+                                    },
+                                  }}
+                                >
+                                  {message.role === 'assistant' ? (
+                                    <>
+                                      {/* 欢迎卡片：标题、问候语、你可能想问 + 推荐问题列表 */}
+                                      {isWelcomeMessage ? (
+                                        <>
+                                          <Icon type='icon-a-kefu' sx={{
+                                            position: 'absolute',
+                                            top: -20,
+                                            right: 32,
+                                            fontSize: 120,
+                                            opacity: 0.06,
+                                            pointerEvents: 'none',
+                                            color: 'primary.main',
+                                          }} />
+                                          <Box sx={{ position: 'relative', zIndex: 1 }}>
+                                            <Typography variant="subtitle2" sx={{ color: 'text.primary', fontWeight: 500, }}>
+                                              您好！我是{botName}，很高兴为您服务。有什么问题可以帮您？
+                                            </Typography>
+                                            {showSupportSuggestions && supportSuggestQuestions.length > 0 && (
+                                              <>
+                                                <Box sx={{ display: 'flex', alignItems: 'center', my: 1.5 }}>
+                                                  <AutoAwesomeIcon sx={{ fontSize: 18, mr: 0.5, color: 'primary.main' }} />
+                                                  <Typography variant="body2" sx={{ fontWeight: 600, fontSize: 12, color: 'primary.main' }}>
+                                                    你可能想问
+                                                  </Typography>
+                                                </Box>
+                                                <Grid container>
+                                                  {supportSuggestQuestions.map((question) => (
+                                                    <Grid size={{ xs: 12, sm: 6 }} sx={{ py: 1, pl: 2, pr: 1, borderLeft: '1px solid', borderColor: '#ECEEF1' }} key={question}>
+                                                      <Box
+                                                        onClick={() => handleSuggestClick(question)}
+                                                        sx={{
+                                                          display: 'flex',
+                                                          alignItems: 'center',
+                                                          cursor: isLoading ? 'default' : 'pointer',
+                                                          color: 'text.secondary',
+                                                          '&:hover': isLoading ? {} : { color: 'primary.main' },
+                                                          '&:hover .welcome-bullet': isLoading ? {} : { borderColor: 'primary.main' },
+                                                        }}
+                                                      >
+                                                        <Icon type='icon-huati' sx={{ fontSize: 14, mr: 1, color: 'text.secondary' }} />
+                                                        <Ellipsis sx={{ flex: 1, fontSize: 12 }}>
+                                                          {question}
+                                                        </Ellipsis>
+                                                      </Box>
+                                                    </Grid>
+                                                  ))}
+                                                </Grid>
+                                              </>
+                                            )}
+                                          </Box>
+                                        </>
+                                      ) : (
+                                        <>
+                                          {/* 搜索结果展示 - 放在最前面 */}
+                                          {message.type === 'search' &&
+                                            message.discCount !== undefined &&
+                                            message.discCount > 0 && (
+                                              <Box
+                                                sx={{
+                                                  mb: message.content ? 2 : 0,
+                                                }}
+                                              >
+                                                {/* 搜索结果标题 - 可点击展开/折叠 */}
+                                                <Box
+                                                  onClick={() => {
+                                                    setExpandedSources((prev) => {
+                                                      const newSet = new Set(prev)
+                                                      if (newSet.has(message.id)) {
+                                                        newSet.delete(message.id)
+                                                      } else {
+                                                        newSet.add(message.id)
+                                                      }
+                                                      return newSet
+                                                    })
+                                                  }}
+                                                  sx={{
+                                                    display: 'flex',
+                                                    alignItems: 'center',
+                                                    justifyContent: 'space-between',
+                                                    py: 1,
+                                                    cursor: 'pointer',
+                                                  }}
+                                                >
+                                                  <Typography
+                                                    variant='body2'
+                                                    sx={{
+                                                      fontWeight: 500,
+                                                      color: 'text.primary',
+                                                      fontSize: '14px',
+                                                    }}
+                                                  >
+                                                    共找到{message.discCount}个结果
+                                                  </Typography>
+                                                  <IconButton
+                                                    size='small'
+                                                    sx={{
+                                                      width: 20,
+                                                      height: 20,
+                                                      color: 'text.secondary',
+                                                      p: 0,
+                                                    }}
+                                                  >
+                                                    {expandedSources.has(message.id) ? (
+                                                      <ExpandLessIcon sx={{ fontSize: 16 }} />
+                                                    ) : (
+                                                      <ExpandMoreIcon sx={{ fontSize: 16 }} />
+                                                    )}
+                                                  </IconButton>
+                                                </Box>
+
+                                                {/* 搜索结果列表 - 可折叠 */}
+                                                <Collapse in={expandedSources.has(message.id)}>
+                                                  <Box
+                                                    sx={{
+                                                      pl: 2,
+                                                      position: 'relative',
+                                                      '&::before': {
+                                                        content: '""',
+                                                        position: 'absolute',
+                                                        left: 0,
+                                                        top: 0,
+                                                        bottom: 0,
+                                                        width: '1px',
+                                                        bgcolor: 'divider',
+                                                      },
+                                                    }}
+                                                  >
+                                                    {message.sources && message.sources.length > 0 ? (
+                                                      <Stack spacing={0}>
+                                                        {message.sources.map((source, idx) => (
+                                                          <Box
+                                                            key={source.id || idx}
+                                                            onClick={() => handleSourceClick(source)}
+                                                            sx={{
+                                                              py: 0.75,
+                                                              px: 1,
+                                                              borderRadius: 1,
+                                                              cursor: 'pointer',
+                                                              color: 'text.primary',
+                                                              transition: 'color 0.2s, background-color 0.2s',
+                                                              '&:hover': {
+                                                                color: 'primary.main',
+                                                                backgroundColor: 'transparent',
+                                                              },
+                                                            }}
+                                                          >
+                                                            <Typography
+                                                              variant='body2'
+                                                              sx={{
+                                                                fontSize: '14px',
+                                                                color: 'inherit',
+                                                                lineHeight: 1.5,
+                                                              }}
+                                                            >
+                                                              {source.title || '无标题'}
+                                                            </Typography>
+                                                          </Box>
+                                                        ))}
+                                                      </Stack>
+                                                    ) : (
+                                                      <Typography
+                                                        variant='body2'
+                                                        sx={{
+                                                          color: 'text.secondary',
+                                                          fontSize: '14px',
+                                                          py: 1,
+                                                        }}
+                                                      >
+                                                        正在加载搜索结果...
+                                                      </Typography>
+                                                    )}
+                                                  </Box>
+                                                </Collapse>
+                                              </Box>
+                                            )}
+
+                                          {/* 消息内容 - 总结文本 */}
+                                          {message.content && message.content.trim() === SEARCH_LOADING_TEXT ? (
+                                            <Box
+                                              sx={{
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                gap: 1.5,
+                                                py: 1.5,
+                                                px: 2,
+                                                color: 'text.secondary',
+                                              }}
+                                            >
+                                              <CircularProgress size={18} thickness={4} sx={{ color: 'text.secondary' }} />
+                                              <Typography variant='body2' sx={{ fontSize: '0.9rem', color: 'text.secondary' }}>
+                                                {SEARCH_LOADING_TEXT}
+                                              </Typography>
+                                            </Box>
+                                          ) : (
+                                            <Box
+                                              sx={{
+                                                '& > *:first-of-type': { mt: 0 },
+                                                '& > *:last-child': { mb: 0 },
+                                                '& p, & h6': {
+                                                  fontSize: '14px',
+                                                  mb: 1,
+                                                  lineHeight: 1.6,
+                                                },
+                                                '& a': {
+                                                  color: theme.palette.primary.main,
+                                                  textDecoration: 'none',
+                                                  whiteSpace: 'normal',
+                                                  '&:hover': {
+                                                    textDecoration: 'underline',
+                                                  },
+                                                },
+                                                '& blockquote': {
+                                                  borderLeft: '4px solid',
+                                                  borderColor: 'divider',
+                                                  mx: 0,
+                                                  pl: 2,
+                                                  py: 1,
+                                                  my: 1.5,
+                                                  bgcolor: alpha(theme.palette.grey[500], 0.05),
+                                                  borderRadius: '0 4px 4px 0',
+                                                  color: 'text.secondary',
+                                                },
+                                                '& ul, & ol': {
+                                                  pl: 3,
+                                                  mb: 1.5,
+                                                },
+                                                '& li': {
+                                                  mb: 0.5,
+                                                },
+                                                '& hr': {
+                                                  borderColor: 'divider',
+                                                  my: 2,
+                                                },
+                                                '& pre': {
+                                                  m: '0.5rem 0',
+                                                  p: 0,
+                                                  bgcolor: 'transparent',
+                                                  borderRadius: 2,
+                                                  overflow: 'hidden',
+                                                },
+                                                // Prevent global code styles from affecting the syntax highlighter
+                                                '& pre code': {
+                                                  bgcolor: 'transparent !important',
+                                                  p: '0 !important',
+                                                  borderRadius: '0 !important',
+                                                  color: 'inherit !important',
+                                                },
+                                                '& table': {
+                                                  borderCollapse: 'collapse',
+                                                  width: '100%',
+                                                  mb: 2,
+                                                  display: 'block',
+                                                  overflowX: 'auto',
+                                                  border: '1px solid',
+                                                  borderColor: 'divider',
+                                                  borderRadius: 1,
+                                                },
+                                                '& th, & td': {
+                                                  border: '1px solid',
+                                                  borderColor: 'divider',
+                                                  p: 1.5,
+                                                  fontSize: '13px',
+                                                },
+                                                '& th': {
+                                                  bgcolor: alpha(theme.palette.grey[500], 0.05),
+                                                  fontWeight: 600,
+                                                  textAlign: 'left',
+                                                },
+                                                '& video': {
+                                                  display: 'block',
+                                                  maxWidth: '100%',
+                                                  height: 'auto',
+                                                  borderRadius: 2,
+                                                  my: 1.5,
+                                                  bgcolor: 'common.black',
+                                                },
+                                                '& img': {
+                                                  display: 'block',
+                                                  maxWidth: '100%',
+                                                  height: 'auto',
+                                                  borderRadius: 2,
+                                                  my: 1.5,
+                                                  cursor: 'zoom-in',
+                                                },
+                                              }}
+                                            >
+                                              <MarkDown
+                                                remarkPlugins={[remarkGfm, remarkBreaks]}
+                                                rehypePlugins={[
+                                                  rehypeRaw,
+                                                  [rehypeSanitize, markdownSanitizeSchema],
+                                                ]}
+                                                components={{
+                                                  a: (props) => <a {...props} target='_blank' rel='noopener noreferrer' />,
+                                                  img: ({ node, ref, src, alt, ...props }) => {
+                                                    if (!src) return null
+
+                                                    const imageSrc = String(src)
+                                                    const imageAlt = typeof alt === 'string' ? alt : ''
+
+                                                    return (
+                                                      <img
+                                                        {...props}
+                                                        src={imageSrc}
+                                                        alt={imageAlt}
+                                                        ref={ref}
+                                                        role='button'
+                                                        tabIndex={0}
+                                                        onClick={() => setPreviewImage({ src: imageSrc, alt: imageAlt })}
+                                                        onKeyDown={(event) => {
+                                                          if (event.key === 'Enter' || event.key === ' ') {
+                                                            event.preventDefault()
+                                                            setPreviewImage({ src: imageSrc, alt: imageAlt })
+                                                          }
+                                                        }}
+                                                      />
+                                                    )
+                                                  },
+                                                  video: ({ node, ref, ...props }) => <video {...props} controls />,
+                                                  code(props) {
+                                                    const { children, className, node, ref, ...rest } = props
+                                                    const match = /language-(\w+)/.exec(className || '')
+                                                    const { inline } = props as any
+                                                    const hasNewline = String(children).includes('\n')
+
+                                                    if (match || (!inline && hasNewline)) {
+                                                      return (
+                                                        <SyntaxHighlighter
+                                                          {...rest}
+                                                          PreTag="div"
+                                                          children={String(children).replace(/\n$/, '')}
+                                                          language={match ? match[1] : 'text'}
+                                                          style={oneDark}
+                                                          customStyle={{
+                                                            margin: 0,
+                                                            borderRadius: '8px',
+                                                            fontSize: '13px',
+                                                            lineHeight: '1.5',
+                                                          }}
+                                                        />
+                                                      )
+                                                    }
+
+                                                    return (
+                                                      <code ref={ref} {...rest} className={className}>
+                                                        {children}
+                                                      </code>
+                                                    )
+                                                  },
+                                                }}
+                                              >
+                                                {message.content}
+                                              </MarkDown>
+                                              {/* 中断提示 - 居中显示 */}
+                                              {message.isInterrupted && (
+                                                <Box
+                                                  sx={{
+                                                    display: 'flex',
+                                                    alignItems: 'center',
+                                                    justifyContent: 'center',
+                                                    mt: 2,
+                                                    pt: 2,
+                                                    borderTop: '1px dashed',
+                                                    borderColor: 'divider',
+                                                  }}
+                                                >
+                                                  <Typography
+                                                    variant='body2'
+                                                    sx={{
+                                                      color: 'text.secondary',
+                                                      fontSize: '0.85rem',
+                                                      display: 'flex',
+                                                      alignItems: 'center',
+                                                      gap: 0.5,
+                                                    }}
+                                                  >
+                                                    <StopIcon sx={{ fontSize: 14, color: 'text.disabled' }} />
+                                                    已停止生成
+                                                  </Typography>
+                                                </Box>
+                                              )}
+                                            </Box>
+                                          )}
+
+                                          {/* 等待提示 - 优化的加载状态 */}
+                                          {waitingStatus !== null && message.id === currentMessageRef.current?.id && (
+                                            <Box
+                                              sx={{
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                gap: 1.5,
+                                                py: 1.5,
+                                                px: 2,
+                                              }}
+                                            >
+                                              <CircularProgress size={18} thickness={4} sx={{ color: 'text.secondary' }} />
+                                              <Typography variant='body2' sx={{ color: 'text.secondary', fontSize: '0.9rem' }}>
+                                                {waitingStatusText || WAITING_STATUS_TEXT.answering}
+                                              </Typography>
+                                            </Box>
+                                          )}
+
+                                          {/* 推荐问题：首条机器人打招呼下方展示 */}
+                                          {showSupportSuggestions && supportSuggestQuestions.length > 0 && index === 0 && (
+                                            <Box
+
+                                            >
+                                              <Box
+                                                sx={{
+                                                  mb: 1,
+                                                  mt: 2,
+                                                  color: 'text.secondary',
+                                                  letterSpacing: '0.2px',
+                                                }}
+                                              >
+                                                你可能想问
+                                              </Box>
+                                              <Stack
+                                                direction='row'
+                                                spacing={1}
+                                                useFlexGap
+                                                flexWrap='wrap'
+                                                sx={{
+                                                  '& button': {
+                                                    justifyContent: 'flex-start',
+                                                    border: '1px solid',
+                                                    borderColor: 'rgba(15, 23, 42, 0.08)',
+                                                    bgcolor: '#ffffff',
+                                                    color: 'text.primary',
+                                                    textTransform: 'none',
+                                                    minHeight: 34,
+                                                    borderRadius: 1,
+                                                    px: 1.5,
+                                                    py: 0.55,
+                                                    fontWeight: 400,
+                                                    letterSpacing: '0.1px',
+                                                    transition: 'all 0.18s ease',
+                                                  },
+                                                  '& button:hover': {
+                                                    color: 'primary.main',
+                                                  },
+                                                }}
+                                              >
+                                                {supportSuggestQuestions.map((question) => (
+                                                  <Button
+                                                    key={question}
+                                                    variant='outlined'
+                                                    size='small'
+                                                    onClick={() => handleSuggestClick(question)}
+                                                    disabled={isLoading}
+                                                    sx={{ textAlign: 'left' }}
+                                                  >
+                                                    {question}
+                                                  </Button>
+                                                ))}
+                                              </Stack>
+                                            </Box>
+                                          )}
+
+                                          {/* 板块选择器 - 用于搜索 */}
+                                          {message.needsForumSelection &&
+                                            message.pendingQuestion &&
+                                            message.type === 'search' &&
+                                            forums &&
+                                            forums.length > 1 && (
+                                              <Box sx={{ mt: 2 }}>
+                                                <Typography
+                                                  variant='subtitle2'
+                                                  sx={{ mb: 1.5, fontWeight: 600, color: 'text.primary' }}
+                                                >
+                                                  请选择板块继续搜索
+                                                </Typography>
+                                                <Stack direction='row' spacing={1} flexWrap='wrap' sx={{ gap: 1 }}>
+                                                  {forums.map((forum) => {
+                                                    if (!forum.id) return null
+                                                    return (
+                                                      <Button
+                                                        key={forum.id}
+                                                        variant='outlined'
+                                                        size='medium'
+                                                        onClick={() =>
+                                                          handleForumSelect(forum.id!, message.pendingQuestion!, message.id)
+                                                        }
+                                                        disabled={isLoading}
+                                                        sx={{
+                                                          textTransform: 'none',
+                                                          borderRadius: 2,
+                                                          px: 2,
+                                                          py: 1,
+                                                          borderColor: 'divider',
+                                                          '&:hover': {
+                                                            borderColor: 'primary.main',
+                                                            bgcolor: alpha(theme.palette.primary.main, 0.05),
+                                                          },
+                                                          fontWeight: 500,
+                                                        }}
+                                                      >
+                                                        {forum.name}
+                                                      </Button>
+                                                    )
+                                                  })}
+                                                </Stack>
+                                              </Box>
+                                            )}
+
+                                          {/* 板块选择器 - 用于发帖 */}
+                                          {message.needsForumSelection &&
+                                            message.pendingQuestion &&
+                                            message.type !== 'search' &&
+                                            forums &&
+                                            forums.length > 1 && (
+                                              <Box sx={{ mt: 2 }}>
+                                                <Typography
+                                                  variant='subtitle2'
+                                                  sx={{ mb: 1.5, fontWeight: 600, color: 'text.primary' }}
+                                                >
+                                                  请选择板块发帖
+                                                </Typography>
+                                                <Stack direction='row' spacing={1} flexWrap='wrap' sx={{ gap: 1 }}>
+                                                  {forums.map((forum) => {
+                                                    if (!forum.id) return null
+                                                    return (
+                                                      <Button
+                                                        key={forum.id}
+                                                        variant='outlined'
+                                                        size='medium'
+                                                        onClick={() =>
+                                                          handleForumSelectForPost(forum.id!, message.pendingQuestion!, message.id)
+                                                        }
+                                                        disabled={isLoading}
+                                                        sx={{
+                                                          textTransform: 'none',
+                                                          borderRadius: 2,
+                                                          px: 2,
+                                                          py: 1,
+                                                          borderColor: 'divider',
+                                                          '&:hover': {
+                                                            borderColor: 'primary.main',
+                                                            bgcolor: alpha(theme.palette.primary.main, 0.05),
+                                                          },
+                                                          fontWeight: 500,
+                                                        }}
+                                                      >
+                                                        {forum.name}
+                                                      </Button>
+                                                    )
+                                                  })}
+                                                </Stack>
+                                              </Box>
+                                            )}
+                                        </>
+                                      )}
+                                    </>
+                                  ) : (
+                                    /* 用户消息内容 */
+                                    <Typography
+                                      variant='body1'
+                                      sx={{ fontSize: '14px', whiteSpace: 'pre-wrap', lineHeight: 1.7 }}
+                                    >
+                                      {message.content}
+                                    </Typography>
+                                  )}
+                                </Paper>
+
+                                {/* 消息底部信息 - 时间戳、复制按钮、免责声明 */}
+                                {message.role === 'assistant' && message.content && index !== 0 && (
+                                  <Box
+                                    sx={{
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      gap: 1.5,
+                                      mt: 0.5,
+                                      pl: 0.5,
+                                      flexWrap: 'wrap',
+                                    }}
+                                  >
+                                    {message.timestamp && (
+                                      <Typography variant='caption' sx={{ color: 'text.disabled', fontSize: '0.7rem' }}>
+                                        生成于 {formatTime(message.timestamp)}
+                                      </Typography>
+                                    )}
+                                    <Tooltip title={copiedMessageId === message.id ? '已复制' : '复制'} arrow>
+                                      <IconButton
+                                        size='small'
+                                        onClick={() => handleCopyMessage(message.content, message.id)}
+                                        sx={{
+                                          width: 20,
+                                          height: 20,
+                                          color: 'text.disabled',
+                                          '&:hover': {
+                                            color: 'primary.main',
+                                            bgcolor: alpha(theme.palette.primary.main, 0.1),
+                                          },
+                                        }}
+                                      >
+                                        <ContentCopyIcon sx={{ fontSize: 12 }} />
+                                      </IconButton>
+                                    </Tooltip>
+                                    <Typography variant='caption' sx={{ color: 'text.disabled', fontSize: '0.7rem' }}>
+                                      本回答由 {botName} AI 驱动，仅供参考
+                                    </Typography>
+                                  </Box>
+                                )}
+
+                                {/* 发帖提问按钮 - 放在气泡外部 */}
+                                {message.role === 'assistant' && (
+                                  <>
+                                    {/* 只有不需要选择板块时才显示发帖按钮 */}
+                                    {message.showPostPrompt &&
+                                      message.originalQuestion &&
+                                      message.isComplete &&
+                                      !message.needsForumSelection &&
+                                      isLastAssistantMessage ? (
+                                      <Box sx={{ mt: 1.5, pl: 0.5 }}>
+                                        <Button
+                                          variant='contained'
+                                          size='small'
+                                          onClick={() =>
+                                            handleGoToPost(
+                                              message.originalQuestion!,
+                                              message.forumId ?? message.sources?.[0]?.forum_id,
+                                              message.id,
+                                            )
+                                          }
+                                          sx={{
+                                            textTransform: 'none',
+                                            borderRadius: 2,
+                                            backgroundColor: theme.palette.primary.main,
+                                            boxShadow: `0 2px 8px ${alpha(theme.palette.primary.main, 0.3)}`,
+                                            '&:hover': {
+                                              backgroundColor: theme.palette.primary.dark,
+                                              boxShadow: `0 4px 12px ${alpha(theme.palette.primary.main, 0.4)}`,
+                                            },
+                                            fontWeight: 600,
+                                          }}
+                                        >
+                                          前往发帖提问
+                                        </Button>
+                                      </Box>
+                                    ) : canShowSearchButton ? (
+                                      <Box sx={{ mt: 1.5, pl: 0.5 }}>
+                                        <Button
+                                          variant='contained'
+                                          size='small'
+                                          disabled={isLoading}
+                                          onClick={() =>
+                                            void handleSearchRelatedPosts(
+                                              message.originalQuestionForSearch || questionForPost,
+                                              message.forumId ?? forumId ?? undefined,
+                                            )
+                                          }
+                                          sx={{
+                                            textTransform: 'none',
+                                            borderRadius: 2,
+                                            backgroundColor: theme.palette.primary.main,
+                                            boxShadow: `0 2px 8px ${alpha(theme.palette.primary.main, 0.3)}`,
+                                            '&:hover': {
+                                              backgroundColor: theme.palette.primary.dark,
+                                              boxShadow: `0 4px 12px ${alpha(theme.palette.primary.main, 0.4)}`,
+                                            },
+                                            fontWeight: 600,
+                                          }}
+                                        >
+                                          搜索相关帖子
+                                        </Button>
+                                      </Box>
+                                    ) : canShowPostButton ? (
+                                      <Box sx={{ mt: 1.5, pl: 0.5 }}>
+                                        <Button
+                                          variant='contained'
+                                          size='small'
+                                          onClick={() => handleGoToPost(questionForPost, message.forumId ?? forumId ?? undefined, undefined)}
+                                          disabled={isLoading}
+                                          sx={{
+                                            textTransform: 'none',
+                                            borderRadius: 2,
+                                            backgroundColor: theme.palette.primary.main,
+                                            boxShadow: `0 2px 8px ${alpha(theme.palette.primary.main, 0.3)}`,
+                                            '&:hover': {
+                                              backgroundColor: theme.palette.primary.dark,
+                                              boxShadow: `0 4px 12px ${alpha(theme.palette.primary.main, 0.4)}`,
+                                            },
+                                            fontWeight: 600,
+                                          }}
+                                        >
+                                          前往发帖提问
+                                        </Button>
+                                      </Box>
+                                    ) : null}
+                                  </>
+                                )}
+                              </Box>
+
+                            </Box>
+                          </Box>
+                        </Box>
+                      ) : (
+                        /* 用户消息布局：头像和内容垂直居中 */
+                        <Box
+                          sx={{
+                            display: 'flex',
+                            gap: 1.5,
+                            alignItems: 'center',
+                            width: '100%',
+                            flexDirection: 'row-reverse',
+                            justifyContent: 'flex-start',
+                          }}
+                        >
+                          {/* 头像 */}
+                          {!isInIframe && (
+                            <UserAvatar
+                              user={displayUser}
+                              showSkeleton={false}
+                              containerSx={{ flexShrink: 0 }}
+                              sx={{
+                                width: 40,
+                                height: 40,
+                                fontSize: isInIframe ? '0.85rem' : '0.95rem',
+                                fontWeight: 600,
+                                color: theme.palette.primary.main,
+                                backgroundColor: 'transparent',
+                              }}
+                            >
+                              {userInitial}
+                            </UserAvatar>
+                          )}
+
+                          {/* 消息气泡 */}
+                          <Box
+                            sx={{
+                              position: 'relative',
+                              maxWidth: '70%',
+                              display: 'flex',
+                              flexDirection: 'column',
+                            }}
+                          >
+                            <Paper
+                              elevation={0}
+                              sx={{
+                                px: 2.5,
+                                py: 1,
+                                borderRadius: 1,
+                                bgcolor: 'primary.main',
+                                color: 'white',
+                                boxShadow: `none`,
+                                fontSize: '14px',
+                                '& p': {
+                                  my: 0,
+                                  lineHeight: 1.5,
+                                },
+                                '& code': {
+                                  bgcolor: 'rgba(255, 255, 255, 0.2)',
+                                  px: 0.75,
+                                  py: 0.25,
+                                  borderRadius: 0.5,
+                                  fontSize: '14px',
+                                  whiteSpace: 'pre-wrap',
+                                  wordBreak: 'break-word',
+                                },
+                              }}
+                            >
+                              <Typography
+                                variant='body1'
+                                sx={{ fontSize: '14px', whiteSpace: 'pre-wrap', lineHeight: 1.7 }}
+                              >
+                                {message.content}
+                              </Typography>
+                            </Paper>
+                          </Box>
+                        </Box>
+                      )}
+                    </Box>
+                  </Fade>
+                )
+              })}
+            </Stack>
+          </Box>
+
+          {/* 底部输入区域 - 现代化设计 */}
+          <Box sx={{ pb: isInIframe ? 0 : 2, pt: 1, px: isInIframe ? 2 : 0 }}>
+            <Box sx={{ maxWidth: '800px', mx: 'auto' }}>
+              {/* 新会话按钮 - 位于输入框左上方 */}
+              <Box sx={{ mb: 1, display: 'flex', alignItems: 'center' }}>
+                <Button
+                  variant='outlined'
+                  size='small'
+                  startIcon={<Icon type='icon-xinduihua' />}
+                  onClick={handleNewSession}
+                  disabled={isLoading}
+                  sx={{
+                    textTransform: 'none',
+                    borderRadius: 2,
+                    bgcolor: 'white',
+                    border: '1px solid',
+                    fontSize: isInIframe ? '12px' : '14px',
+                    borderColor: alpha(theme.palette.grey[400], 0.3),
+                    color: 'text.primary',
+                    boxShadow: 'none',
+                    '&:hover': {
+                      borderColor: alpha(theme.palette.grey[400], 0.5),
+                      bgcolor: 'grey.50',
+                      boxShadow: 'none',
+                    },
+                    '&:disabled': {
+                      bgcolor: 'white',
+                      borderColor: alpha(theme.palette.grey[400], 0.3),
+                      color: 'text.disabled',
+                      opacity: 0.6,
+                    },
+                    '& .MuiButton-startIcon': {
+                      marginRight: 1,
+                    },
+                  }}
+                >
+                  新问题
+                </Button>
+              </Box>
+              <Box
+                sx={{
+                  position: 'relative',
+                  borderRadius: '10px',
+                  border: '1px solid',
+                  borderColor: isInputFocused ? 'primary.main' : 'divider',
+                  transition: 'border-color 0.2s ease',
+                }}
+              >
+                <TextField
+                  fullWidth
+                  multiline
+                  minRows={3}
+                  maxRows={8}
+                  placeholder='请使用产品 + 问题描述你的问题'
+                  value={inputValue}
+                  onChange={(e) => setInputValue(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  onFocus={() => setIsInputFocused(true)}
+                  onBlur={() => setIsInputFocused(false)}
+                  disabled={isLoading}
+                  variant='standard'
+                  slotProps={{
+                    input: {
+                      disableUnderline: true,
+                      sx: {
+                        px: 2.5,
+                        py: 1.5,
+                        pr: 6, // 为按钮留出右侧空间
+                        fontSize: isInIframe ? '0.875rem' : '0.95rem',
+                        lineHeight: 1.6,
+                        '& .MuiInputBase-input::placeholder': {
+                          fontSize: isInIframe ? '0.8rem' : '0.95rem',
+                        },
+                      },
+                    },
+                  }}
+                />
+                {/* 发送/停止按钮 - 位于输入框内部右下角，初始加载时隐藏 */}
+                {!isInitialLoading && (
+                  <Box
+                    sx={{
+                      position: 'absolute',
+                      bottom: 8,
+                      right: 8,
+                      zIndex: 1,
+                    }}
+                  >
+                    {isLoading ? (
+                      <Tooltip title='停止生成' arrow>
+                        <Box sx={{ position: 'relative', display: 'inline-flex' }}>
+                          <CircularProgress
+                            size={26}
+                            thickness={2}
+                            sx={{
+                              color: 'primary',
+                              position: 'absolute',
+                              top: 0,
+                              left: 0,
+                            }}
+                          />
+                          <IconButton
+                            color='primary'
+                            onClick={handleStop}
+                            sx={{
+                              width: 26,
+                              height: 26,
+                            }}
+                          >
+                            <StopIcon sx={{ fontSize: 20 }} />
+                          </IconButton>
+                        </Box>
+                      </Tooltip>
+                    ) : (
+                      <Tooltip title='发送消息' arrow>
+                        <IconButton
+                          color='primary'
+                          onClick={handleSend}
+                          disabled={!inputValue.trim()}
+                          sx={{
+                            width: 26,
+                            height: 26,
+                          }}
+                        >
+                          <SendIcon sx={{ fontSize: 20 }} />
+                        </IconButton>
+                      </Tooltip>
+                    )}
+                  </Box>
+                )}
+                <Dialog
+                  open={!!previewImage}
+                  onClose={() => setPreviewImage(null)}
+                  maxWidth={false}
+                  PaperProps={{
+                    sx: {
+                      bgcolor: 'transparent',
+                      boxShadow: 'none',
+                      m: 2,
+                    },
+                  }}
+                  slotProps={{
+                    backdrop: {
+                      sx: { backgroundColor: 'rgba(0, 0, 0, 0.82)' },
+                    },
+                  }}
+                >
+                  {previewImage && (
+                    <Box
+                      component='img'
+                      src={previewImage.src}
+                      alt={previewImage.alt}
+                      onClick={() => setPreviewImage(null)}
+                      sx={{
+                        display: 'block',
+                        maxWidth: 'calc(100vw - 32px)',
+                        maxHeight: 'calc(100vh - 32px)',
+                        objectFit: 'contain',
+                        cursor: 'zoom-out',
+                        borderRadius: 1,
+                      }}
+                    />
+                  )}
+                </Dialog>
+                <Dialog
+                  open={sessionExpiredDialogOpen}
+                  onClose={() => setSessionExpiredDialogOpen(false)}
+                  aria-labelledby='session-expired-dialog-title'
+                  aria-describedby='session-expired-dialog-description'
+                >
+                  <DialogTitle id='session-expired-dialog-title'>会话已过期</DialogTitle>
+                  <DialogContent>
+                    <DialogContentText id='session-expired-dialog-description'>
+                      此问答已过期，是否开启新会话？
+                    </DialogContentText>
+                  </DialogContent>
+                  <DialogActions>
+                    <Button onClick={() => setSessionExpiredDialogOpen(false)} color='inherit'>
+                      取消
+                    </Button>
+                    <Button
+                      onClick={() => {
+                        setSessionExpiredDialogOpen(false)
+                        handleNewSession()
+                      }}
+                      autoFocus
+                    >
+                      开启新会话
+                    </Button>
+                  </DialogActions>
+                </Dialog>
+              </Box>
+              {isInIframe && <BrandAttribution simple />}
+            </Box>
+          </Box>
+        </>
+      )}
+    </Box>
+  )
+}

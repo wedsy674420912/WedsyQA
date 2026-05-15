@@ -1,0 +1,85 @@
+package repo
+
+import (
+	"context"
+
+	"github.com/chaitin/koalaqa/model"
+	"github.com/chaitin/koalaqa/pkg/database"
+	"gorm.io/gorm"
+)
+
+type KnowledgeBase struct {
+	base[*model.KnowledgeBase]
+}
+
+func (kb *KnowledgeBase) list(ctx context.Context, res any, scopes ...database.Scope) error {
+	return kb.model(ctx).Scopes(scopes...).Find(res).Error
+}
+
+func (kb *KnowledgeBase) ListWithDocCount(ctx context.Context, res any) error {
+	return kb.list(ctx, res, func(db *database.DB) *database.DB {
+		return db.Select([]string{
+			"knowledge_bases.*",
+			"doc.qa_count as qa_count",
+			"doc.doc_count as doc_count",
+			"doc.web_count as web_count",
+			"doc.space_count as space_count",
+		}).
+			Joins("LEFT JOIN (?) as doc ON doc.kb_id = knowledge_bases.id",
+				kb.db.Model(&model.KBDocument{}).
+					Select(`kb_id,
+						COUNT(*) FILTER (WHERE doc_type = ?) AS qa_count,
+						COUNT(*) FILTER (WHERE doc_type = ?) AS doc_count,
+						COUNT(*) FILTER (WHERE doc_type = ?) AS web_count,
+						COUNT(*) FILTER (WHERE doc_type = ? AND parent_id = 0) AS space_count`,
+						model.DocTypeQuestion,
+						model.DocTypeDocument,
+						model.DocTypeWeb,
+						model.DocTypeSpace).
+					Group("kb_id"),
+			)
+	})
+}
+
+func (kb *KnowledgeBase) DeleteByID(ctx context.Context, id uint) error {
+	return kb.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		err := tx.Model(&model.KnowledgeBase{}).Where("id = ?", id).Delete(nil).Error
+		if err != nil {
+			return err
+		}
+		err = tx.Model(&model.KBDocument{}).Where("kb_id = ?", id).Delete(nil).Error
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func (kb *KnowledgeBase) FirstID(ctx context.Context) (uint, error) {
+	var id uint
+	if err := kb.model(ctx).Limit(1).Pluck("id", &id).Error; err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func (kb *KnowledgeBase) GetFirst(ctx context.Context) (*model.KnowledgeBase, error) {
+	var res model.KnowledgeBase
+	err := kb.model(ctx).Where("true").Order("id ASC").First(&res).Error
+	if err != nil {
+		return nil, err
+	}
+
+	return &res, nil
+}
+
+func newKnowledgeBase(db *database.DB) *KnowledgeBase {
+	return &KnowledgeBase{
+		base: base[*model.KnowledgeBase]{db: db, m: &model.KnowledgeBase{}},
+	}
+}
+
+func init() {
+	register(newKnowledgeBase)
+}
