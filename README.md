@@ -9,11 +9,6 @@
 
 
 
-<p align="center">
-  <a target="_blank" href="https://koalaqa.docs.baizhi.cloud/welcome">📖 产品文档</a> &nbsp; | &nbsp;
-  <a target="_blank" href="https://bbs.baizhi.cloud/">🚀 问答论坛</a>
-</p>
-
 ## 👋 项目介绍
 **WedsyQA** 是一款 AI 大模型驱动的开源智能售后服务产品，提供 **AI 客服、AI 洞察、AI 搜索、AI 运营**等能力，帮助你快速搭建**企业内外部问答平台、开发者社区、用户服务社区**，帮助团队显著降低人工运营成本、提升客户满意度与响应效率，助力实现 ZCR（Zero Contact Resolution, 零人工介入解决）目标。
 
